@@ -53,7 +53,10 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 }
 
 export const name = 'claude';
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
+// v4: orphaned subagent transcripts now publish their session row. The marker
+// moves so an install that already indexed those transcripts (and therefore
+// holds their cursors) replays them once and gains the missing rows.
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v4__';
 
 // Vendor forks of Claude Code keep the same on-disk layout under their own
 // home directory. They are separate providers rather than extra roots of
@@ -437,7 +440,9 @@ function* parseWithSource(unit: IndexUnit, cursor: Cursor, source: string): Gene
   // from the catalogue, from session detail, and from every statement that
   // joins sessions. The subagent transcript is the only surviving witness, so
   // it publishes the row. Counting is delta because several subagents share one
-  // session id; a main transcript that reappears later replaces the count.
+  // session id; a replay would otherwise re-add the same messages, so
+  // repairOrphanedSessionCounts restates the count from the stored rows whenever
+  // this transcript is gone.
   const mainTranscriptPath = isSubagent ? mainTranscriptPathOf(unit) : null;
   const orphanedSubagent = mainTranscriptPath !== null && !existsSync(mainTranscriptPath);
   if (!isSubagent || orphanedSubagent) {

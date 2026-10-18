@@ -20,7 +20,11 @@ import { join } from 'node:path';
 
 import { parse } from '../packages/core/src/providers/claude.ts';
 import { persist } from '../packages/core/src/persist.ts';
-import { backfillSessionTitles, refreshSessionProjectPaths } from '../packages/core/src/index-finalize.ts';
+import {
+  backfillSessionTitles,
+  refreshSessionProjectPaths,
+  repairOrphanedSessionCounts,
+} from '../packages/core/src/index-finalize.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -194,5 +198,37 @@ test('title backfill fills blanks only, truncates, and skips message-less sessio
 
   // Idempotent: a second pass finds nothing left to fill.
   assert.equal(backfillSessionTitles(db), 0);
+  db.close();
+});
+
+test('a replayed orphan unit recovers its count instead of growing it', () => {
+  // Orphan rows are counted with `countMode: 'delta'` (several subagents share
+  // one session id). A replay — marker bump, vanished cursor row, retried unit —
+  // adds that unit's messages again, so the stored count drifts above the rows.
+  // Nothing on the provider side can restate it: the main transcript that owned
+  // the total is gone. The repair pass derives it from the rows instead.
+  const root = makeTempDir('obelisk-orphan-replay-');
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+
+  const first = writeSubagentTranscript(root, 'agent-a', [
+    message('sa-1', 'first line of the run', { timestamp: '2026-06-10T10:00:00Z' }),
+    message('sa-2', 'work in progress', { role: 'assistant', timestamp: '2026-06-10T10:00:01Z' }),
+  ]);
+  const unit = subagentUnit(first, 'agent-a');
+  persist(db, unit, parse(unit, null));
+  assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count, 2);
+
+  // Same unit replayed from scratch, exactly what a marker bump produces.
+  persist(db, unit, parse(unit, null));
+  const drifted = db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count;
+  assert.equal(drifted, 4, 'delta semantics are what makes the replay visible');
+
+  assert.equal(repairOrphanedSessionCounts(db), 1);
+  assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(SESSION_ID).n, 2);
+
+  // Idempotent: a second pass has nothing left to correct.
+  assert.equal(repairOrphanedSessionCounts(db), 0);
   db.close();
 });

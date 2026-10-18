@@ -6,6 +6,7 @@
 // transactions; this module owns the invariants that must not diverge between
 // the two indexing modes.
 
+import { existsSync } from 'node:fs';
 import { inferProjectPath } from './parsing.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
@@ -117,8 +118,11 @@ function titleFromMessageText(text: unknown): string | null {
     const line = rawLine.trim();
     if (line.length === 0 || line.startsWith('<') || WARMUP_PROMPT.test(line)) continue;
     if (line.length < 3 || !HAS_WORD.test(line)) continue;
-    return line.length > SESSION_TITLE_MAX_CHARS
-      ? `${line.slice(0, SESSION_TITLE_MAX_CHARS - 1).trimEnd()}…`
+    // Slice by code point: a UTF-16 cut can split an emoji or a rare CJK
+    // character and leave a lone surrogate in the catalogue.
+    const chars = [...line];
+    return chars.length > SESSION_TITLE_MAX_CHARS
+      ? `${chars.slice(0, SESSION_TITLE_MAX_CHARS - 1).join('').trimEnd()}…`
       : line;
   }
   return null;
@@ -139,39 +143,99 @@ function titleFromMessageText(text: unknown): string | null {
  * persist writes provider titles with `r.title ?? prev?.title`.
  */
 export function backfillSessionTitles(db: SqliteDb): number {
-  const candidates = db.prepare(`
-    WITH opening AS (
-      SELECT s.id AS session_id, m.text AS text,
-             ROW_NUMBER() OVER (
-               PARTITION BY s.id ORDER BY m.timestamp IS NULL, m.timestamp, m.uuid
-             ) AS rank
-      FROM sessions s
-      JOIN messages m ON m.session_id = s.id
-      WHERE (s.title IS NULL OR trim(s.title) = '')
-        AND m.role = 'user'
-        AND m.text IS NOT NULL
-        AND trim(m.text) <> ''
-    )
-    SELECT session_id, text FROM opening
-    WHERE rank <= ${SESSION_TITLE_CANDIDATES}
-    ORDER BY session_id, rank
-  `).all();
-  const update = db.prepare('UPDATE sessions SET title = ? WHERE id = ?');
-  const titled = new Set<string>();
+  const untitled = db.prepare(
+    "SELECT id FROM sessions WHERE title IS NULL OR trim(title) = ''",
+  ).all();
+  if (untitled.length === 0) return 0;
+  // One index seek per untitled session. A single windowed join over `messages`
+  // is shaped the other way round — it scans every message (2M rows on a real
+  // corpus) and holds the caller's write transaction for 14-17 s. Staying on
+  // idx_messages_session keeps this in the millisecond range and lets the pass
+  // run on every incremental build.
+  const opening = db.prepare(`
+    SELECT text FROM messages
+    WHERE session_id = ?
+      AND role = 'user'
+      AND text IS NOT NULL AND trim(text) <> ''
+      AND COALESCE(is_meta, 0) = 0
+      AND agent_id IS NULL
+      AND COALESCE(visibility, 'visible') = 'visible'
+    ORDER BY timestamp IS NULL, timestamp, uuid
+    LIMIT ${SESSION_TITLE_CANDIDATES}
+  `);
+  // A session rebuilt from an orphaned subagent log has nothing but subagent
+  // turns, so the main-agent filter would leave it untitled forever. Fall back
+  // to any user record — `titleFromMessageText` still rejects plumbing.
+  const openingFallback = db.prepare(`
+    SELECT text FROM messages
+    WHERE session_id = ?
+      AND role = 'user'
+      AND text IS NOT NULL AND trim(text) <> ''
+      AND COALESCE(visibility, 'visible') = 'visible'
+    ORDER BY timestamp IS NULL, timestamp, uuid
+    LIMIT ${SESSION_TITLE_CANDIDATES}
+  `);
+  // Re-check the precondition in the UPDATE: a provider that learned a real
+  // title between the SELECT and this write must keep it.
+  const update = db.prepare(
+    "UPDATE sessions SET title = ? WHERE id = ? AND (title IS NULL OR trim(title) = '')",
+  );
+  const firstTitle = (rows: readonly { text?: unknown }[]): string | null => {
+    for (const row of rows) {
+      const title = titleFromMessageText(row.text);
+      if (title !== null) return title;
+    }
+    return null;
+  };
   let filled = 0;
-  for (const row of candidates) {
-    const id = String(row.session_id);
-    if (titled.has(id)) continue;
-    const title = titleFromMessageText(row.text);
+  for (const session of untitled) {
+    const id = String(session.id);
+    const title = firstTitle(opening.all(id)) ?? firstTitle(openingFallback.all(id));
     if (title === null) continue;
     update.run(title, id);
-    titled.add(id);
     filled++;
   }
   return filled;
 }
 
-/** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean {
+/**
+ * Recompute `message_count` for sessions whose transcript no longer exists.
+ *
+ * Sessions rebuilt from the last surviving subagent log (see the claude
+ * adapter) are counted with `countMode: 'delta'`, because several subagent
+ * files share one session id. A replay — marker bump, lost cursor row, failed
+ * unit retried — re-adds that unit's messages instead of replacing them, so the
+ * count drifts above the rows actually stored. Nothing can correct it from the
+ * provider side, because the main transcript that used to own the total is
+ * exactly what is missing.
+ *
+ * Rows are the authority here: their transcript is gone, so the count is
+ * derived from them. Idempotent by construction — after the first pass the
+ * stored count equals `COUNT(*)` and the statement is a no-op.
+ */
+export function repairOrphanedSessionCounts(db: SqliteDb): number {
+  const sessions = db.prepare(`
+    SELECT id, jsonl_path, message_count FROM sessions
+    WHERE jsonl_path IS NOT NULL AND jsonl_path <> ''
+  `).all();
+  if (sessions.length === 0) return 0;
+  const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?');
+  const update = db.prepare('UPDATE sessions SET message_count = ? WHERE id = ?');
+  let repaired = 0;
+  for (const session of sessions) {
+    // A readable transcript stays authoritative: it can be re-parsed, and
+    // `message_count` may legitimately cover rows the adapter chose to fold.
+    if (existsSync(String(session.jsonl_path))) continue;
+    const actual = Number(count.get(String(session.id))?.n ?? 0);
+    if (actual === Number(session.message_count ?? 0)) continue;
+    update.run(actual, String(session.id));
+    repaired++;
+  }
+  return repaired;
+}
+
+/** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */
+export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean {
   const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
     .get(PROJECT_PATH_BACKFILL_MARKER);
   if (done) return false;
