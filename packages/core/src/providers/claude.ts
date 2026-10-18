@@ -55,6 +55,16 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 export const name = 'claude';
 export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
 
+// Vendor forks of Claude Code keep the same on-disk layout under their own
+// home directory. They are separate providers rather than extra roots of
+// `claude`, because a session is identified by its bare transcript UUID: two
+// forks that ever mint the same UUID would collide on the sessions primary key,
+// and `source` is what lets query/UI attribute a row to the CLI that wrote it.
+// Non-default forks therefore namespace their session ids with `<id>:`.
+function canonicalSessionId(source: string, rawSessionId: string): string {
+  return source === name ? rawSessionId : `${source}:${rawSessionId}`;
+}
+
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
   readonly mainTranscriptPath: string;
@@ -77,7 +87,7 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
   return seen ? total : null;
 }
 
-function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
+function discoverAt(rootDir: string, ctx: DiscoverContext, source = name): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
   if (!existsSync(projectsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
     ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
@@ -126,7 +136,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       || cursorSignatureDiffers(cursor, file.path);
   }).map((f: any) => ({
     key: f.path,
-    sessionId: f.sessionId,
+    sessionId: canonicalSessionId(source, f.sessionId),
     project: f.project,
     isSubagent: f.isSubagent,
     agentId: f.agentId,
@@ -175,7 +185,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         if (!relationshipChanged && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
         workflowUnits.push({
           key: workflowPath,
-          sessionId,
+          sessionId: canonicalSessionId(source, sessionId),
           project,
           meta: { kind: 'workflow', mainTranscriptPath } satisfies ClaudeWorkflowUnitMeta,
         });
@@ -186,7 +196,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.claude'), ctx);
+  return discoverAt(join(homedir(), '.claude'), ctx, name);
 }
 
 function toolResultText(content: unknown): string {
@@ -272,7 +282,7 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   return outCursor;
 }
 
-export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+function* parseWithSource(unit: IndexUnit, cursor: Cursor, source: string): Generator<TranscriptRecord, Cursor> {
   if ((unit.meta as ClaudeWorkflowUnitMeta | undefined)?.kind === 'workflow') {
     return yield* parseWorkflow(unit);
   }
@@ -365,7 +375,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
         model: msg.model || null,
         is_sidechain: obj.isSidechain ? 1 : 0, agent_id: aid,
         input_tokens: totalInputTokens(usage), output_tokens: usage.output_tokens || null,
-        cwd: obj.cwd || null, skill: obj.attributionSkill || null, source: 'claude',
+        cwd: obj.cwd || null, skill: obj.attributionSkill || null, source,
       });
     }
 
@@ -425,12 +435,22 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
       kind: 'session', id: unit.sessionId, title: customTitle ?? aiTitle ?? historyTitle, project: unit.project || null,
       started_at: sm.started_at, ended_at: sm.ended_at, git_branch: sm.git_branch,
       version: sm.version, message_count: sm.n, countMode: skip > 0 ? 'delta' : 'total',
-      jsonl_path: unit.key, source: 'claude',
+      jsonl_path: unit.key, source,
     });
   }
 
   yield* records;
   return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+}
+
+export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+  return yield* parseWithSource(unit, cursor, name);
+}
+
+function bareSessionId(sessionId: unknown): string {
+  const text = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  const separator = text.indexOf(':');
+  return separator === -1 ? text : text.slice(separator + 1);
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {
@@ -440,8 +460,8 @@ function rawClaude(input: RawLookup): RawRecord | null {
   if (input.agentId !== null) {
     const runId = input.workflowAgent?.['run_id'];
     sourcePath = typeof runId === 'string'
-      ? join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', 'workflows', runId, `${input.agentId}.jsonl`)
-      : join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', `${input.agentId}.jsonl`);
+      ? join(dirname(mainPath), bareSessionId(input.session?.id), 'subagents', 'workflows', runId, `${input.agentId}.jsonl`)
+      : join(dirname(mainPath), bareSessionId(input.session?.id), 'subagents', `${input.agentId}.jsonl`);
   }
   if (!existsSync(sourcePath)) return null;
   let found: string | null = null;
@@ -471,17 +491,34 @@ function rawClaude(input: RawLookup): RawRecord | null {
     : { text: raw, totalLength: raw.length, offset: 0, limit: raw.length, hasMore: false, messageText };
 }
 
-export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: { rootDir?: string } = {}): ProviderAdapter {
+export function createClaudeProvider({
+  rootDir = join(homedir(), '.claude'),
+  id = name,
+  displayName = 'Claude Code',
+  vendor = 'Anthropic',
+  color = '#d97757',
+}: {
+  rootDir?: string;
+  /** Source tag; defaults to `claude`. Forks must pass a distinct id. */
+  id?: string;
+  displayName?: string;
+  vendor?: string;
+  color?: string;
+} = {}): ProviderAdapter {
   return {
-    name,
-    descriptor: { id: name, name: 'Claude Code', vendor: 'Anthropic', defaultRoot: rootDir, color: '#d97757' },
-    indexVersionMarker: CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
+    name: id,
+    descriptor: { id, name: displayName, vendor, defaultRoot: rootDir, color },
+    // A fork replays its own transcripts: sharing the marker with `claude`
+    // would let either provider's marker satisfy the other's replay gate.
+    indexVersionMarker: id === name
+      ? CLAUDE_CANONICAL_TRANSCRIPT_MARKER
+      : `${CLAUDE_CANONICAL_TRANSCRIPT_MARKER}:${id}`,
     watchTargets: (configuredRoot) => [
       { kind: 'tree', path: join(configuredRoot, 'projects') },
       { kind: 'file', path: join(configuredRoot, 'history.jsonl') },
     ],
-    discover: (ctx) => discoverAt(rootDir, ctx),
-    parse,
+    discover: (ctx) => discoverAt(rootDir, ctx, id),
+    parse: (unit, cursor) => parseWithSource(unit, cursor, id),
     raw: rawClaude,
   };
 }
