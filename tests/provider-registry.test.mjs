@@ -66,9 +66,9 @@ test('provider registry drives source catalog, watch roots, and raw lookup', () 
 test('built-in provider registry exposes every source without caller-side branching', () => {
   const registry = createBuiltinProviderRegistry({
     claude: '/sources/claude',
-    'claude-internal': '/sources/claude-internal',
-    'claude-tme': '/sources/claude-tme',
-    'claude-lens': '/sources/claude-lens',
+    'claude-alt': '/sources/claude-internal',
+    'claude-vendor': '/sources/claude-tme',
+    'claude-beta': '/sources/claude-lens',
     codex: '/sources/codex',
     copilot: '/sources/copilot',
     cursor: '/sources/cursor',
@@ -84,9 +84,9 @@ test('built-in provider registry exposes every source without caller-side branch
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
-    { id: 'claude-internal', name: 'Claude Code (Internal)' },
-    { id: 'claude-tme', name: 'Claude Code (TME)' },
-    { id: 'claude-lens', name: 'Claude Code (Lens)' },
+    { id: 'claude-alt', name: 'Claude Code (alt build)' },
+    { id: 'claude-vendor', name: 'Claude Code (vendor fork)' },
+    { id: 'claude-beta', name: 'Claude Code (beta)' },
     { id: 'codex', name: 'Codex' },
     { id: 'copilot', name: 'GitHub Copilot' },
     { id: 'cursor', name: 'Cursor' },

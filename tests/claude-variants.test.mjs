@@ -50,33 +50,33 @@ test('claude fork: a non-default id namespaces session ids and stamps its own so
   writeVariantSession(root);
   const provider = createClaudeProvider({
     rootDir: root,
-    id: 'claude-tme',
-    displayName: 'Claude Code (TME)',
-    vendor: 'Tencent TME fork',
+    id: 'claude-vendor',
+    displayName: 'Claude Code (vendor fork)',
+    vendor: 'Vendor fork',
   });
   const units = provider.discover({ lastCursor: () => null });
   assert.equal(units.length, 1);
-  assert.equal(units[0].sessionId, 'claude-tme:sid-1');
+  assert.equal(units[0].sessionId, 'claude-vendor:sid-1');
 
   const records = drain(provider.parse(units[0], null));
   const session = records.find((record) => record.kind === 'session');
-  assert.equal(session.id, 'claude-tme:sid-1');
-  assert.equal(session.source, 'claude-tme');
+  assert.equal(session.id, 'claude-vendor:sid-1');
+  assert.equal(session.source, 'claude-vendor');
   assert.equal(session.title, 'Variant session');
 
   const message = records.find((record) => record.kind === 'message');
-  assert.equal(message.session_id, 'claude-tme:sid-1');
-  assert.equal(message.source, 'claude-tme');
+  assert.equal(message.session_id, 'claude-vendor:sid-1');
+  assert.equal(message.source, 'claude-vendor');
 });
 
 test('claude fork: forks never share a replay marker with the default provider', () => {
-  const fork = createClaudeProvider({ rootDir: '/tmp/x', id: 'claude-lens', displayName: 'Claude Code (Lens)' });
+  const fork = createClaudeProvider({ rootDir: '/tmp/x', id: 'claude-alt', displayName: 'Claude Code (alt build)' });
   const base = createClaudeProvider({ rootDir: '/tmp/x' });
   assert.equal(base.indexVersionMarker, CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
   assert.notEqual(fork.indexVersionMarker, CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
-  assert.match(String(fork.indexVersionMarker), /claude-lens/);
+  assert.match(String(fork.indexVersionMarker), /claude-alt/);
   assert.equal(fork.name, fork.descriptor.id);
-  assert.equal(fork.descriptor.name, 'Claude Code (Lens)');
+  assert.equal(fork.descriptor.name, 'Claude Code (alt build)');
 });
 
 test('claude fork: the default provider keeps bare session ids and the historical source tag', () => {
