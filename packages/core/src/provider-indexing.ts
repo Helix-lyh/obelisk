@@ -37,6 +37,11 @@ export interface ProviderIndexPlan {
   readonly replayKeys: ReadonlyMap<string, readonly string[]>;
   readonly incompleteProviders: ReadonlySet<string>;
   readonly inventoryIssues: readonly ProviderInventoryIssue[];
+  /**
+   * Known artifacts the adapter version cannot project. These describe content,
+   * not inventory: they never withhold a provider marker or a force publish.
+   */
+  readonly skippedArtifacts: readonly ProviderInventoryIssue[];
 }
 
 export interface ProviderIndexResult {
@@ -201,6 +206,7 @@ export function createProviderIndexPlan(
   const replayKeys = new Map<string, readonly string[]>();
   const incompleteProviders = new Set<string>();
   const inventoryIssues: ProviderInventoryIssue[] = [];
+  const skippedArtifacts: ProviderInventoryIssue[] = [];
   const provenance = priorSessions ?? readProviderSessionProvenance(db);
   for (const provider of registry.list()) {
     const indexedSessions = provenance
@@ -225,6 +231,10 @@ export function createProviderIndexPlan(
       reportIncompleteInventory: (issue) => {
         inventoryComplete = false;
         reportedIssue ??= issue;
+      },
+      reportSkippedArtifact: (issue) => {
+        if (issue === undefined) return;
+        skippedArtifacts.push({ ...issue, provider: provider.name });
       },
     });
     if (!inventoryComplete) {
@@ -260,7 +270,7 @@ export function createProviderIndexPlan(
       });
     }
   }
-  return { items, pendingMarkers, replayKeys, incompleteProviders, inventoryIssues };
+  return { items, pendingMarkers, replayKeys, incompleteProviders, inventoryIssues, skippedArtifacts };
 }
 
 export function indexProviderPlan({

@@ -212,6 +212,15 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       const providerPlan = createProviderIndexPlan(db, registry, { force, readMode });
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
+      // Known-but-unprojectable artifacts are skips, not inventory gaps: they are
+      // surfaced like any other skipped file and must not withhold the snapshot.
+      for (const artifact of providerPlan.skippedArtifacts) {
+        skippedFiles.push({
+          provider: artifact.provider,
+          path: artifact.path,
+          error: artifact.error,
+        });
+      }
       if (force && incompleteProviders.length > 0) {
         return {
           skip: false,
@@ -219,7 +228,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           reason: 'incomplete_snapshot',
           incompleteProviders,
           inventoryIssues,
-          skipped: 0,
+          skipped: skippedFiles.length,
           skippedFiles,
         };
       }
@@ -285,7 +294,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           complete: true,
           incompleteProviders,
           inventoryIssues,
-          skipped: 0,
+          skipped: skippedFiles.length,
           skippedFiles,
           watchHints: readRecentTranscriptHints(db),
         };

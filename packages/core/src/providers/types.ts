@@ -66,6 +66,17 @@ export interface DiscoverContext {
   indexedSessions?(): readonly IndexedSession[];
   /** Report that the source inventory could not be enumerated completely. */
   reportIncompleteInventory?(issue?: InventoryIssue): void;
+  /**
+   * Report an artifact whose identity is known but whose content this adapter
+   * version cannot project (for example a session file carrying a format
+   * version newer than the adapter supports).
+   *
+   * This is NOT an incomplete inventory: the path was enumerated, so tombstones
+   * stay precise, and the adapter is expected to suppress whatever it cannot
+   * prove (its project directory) rather than emit a partial tree. Reporting it
+   * here records the skip for the user without withholding the build.
+   */
+  reportSkippedArtifact?(issue?: InventoryIssue): void;
 }
 
 /** Canonical language emitted by every provider adapter. Persist serializes it;
