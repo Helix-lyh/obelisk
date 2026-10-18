@@ -192,3 +192,42 @@ test('grok: subagent sessions are indexed with an identifying title prefix', () 
   const session = values.find((record) => record.kind === 'session');
   assert.equal(session.title, '[general-purpose] Fix the build');
 });
+
+test('grok: a provider id reused inside one session keeps both rows and breaks the parent loop', () => {
+  // Grok reuses the same `rs_…` id when a turn is retried. With `messages`
+  // keyed by uuid alone the second copy used to overwrite the first and inherit
+  // itself as parent — a context walk on that row never terminated.
+  const root = makeTempDir('obelisk-grok-dup-');
+  const { transcript } = writeSession(root, {
+    events: [
+      { type: 'user', content: [{ type: 'text', text: 'first pass' }] },
+      { type: 'reasoning', id: 'rs_dup', summary: [{ type: 'summary_text', text: 'first thought' }] },
+      { type: 'reasoning', id: 'rs_dup', summary: [{ type: 'summary_text', text: 'second thought' }] },
+    ],
+  });
+  const provider = createGrokProvider({ rootDir: root });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+
+  const reasoning = values.filter((record) => record.kind === 'message' && record.type === 'reasoning');
+  assert.equal(reasoning.length, 2);
+  assert.equal(new Set(reasoning.map((record) => record.uuid)).size, 2);
+  for (const record of reasoning) {
+    assert.notEqual(record.parent_uuid, record.uuid, 'a row must never be its own parent');
+  }
+  assert.deepEqual(
+    reasoning.map((record) => record.text),
+    ['first thought', 'second thought'],
+  );
+
+  // The raw lookup walks the file with the same numbering, so the second copy
+  // is still addressable.
+  const second = provider.raw({
+    source: 'grok',
+    messageUuid: reasoning[1].uuid,
+    session: { id: unit.sessionId, jsonl_path: transcript },
+    agentId: null,
+  });
+  assert.ok(second !== null);
+  assert.match(second.messageText, /second thought/);
+});

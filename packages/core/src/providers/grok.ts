@@ -212,6 +212,28 @@ function grokToolId(sessionId: string, callId: string): string {
   return `grok-${sessionId}-tc-${callId}`;
 }
 
+/**
+ * Session-scoped message id, stable across replays.
+ *
+ * Provider ids are unique per conversation at best. Reasoning rows reuse the
+ * same `rs_…` id when Grok retries a turn, and `messages` is keyed by uuid
+ * alone, so a plain `grok-<sid>-<id>` would overwrite the earlier copy and leave
+ * a row whose `parent_uuid` points at itself — a context walk on it never
+ * terminates. Repeats get a `-2`, `-3`, … suffix. Both parse and raw scan the
+ * file in the same order, so the suffix is reproducible without storing it.
+ */
+function sessionUuid(
+  sessionId: string,
+  rawId: unknown,
+  rowIndex: number,
+  seen: Map<string, number>,
+): string {
+  const base = `grok-${sessionId}-${typeof rawId === 'string' && rawId ? rawId : rowIndex}`;
+  const occurrence = (seen.get(base) ?? 0) + 1;
+  seen.set(base, occurrence);
+  return occurrence === 1 ? base : `${base}-${occurrence}`;
+}
+
 interface GrokEvent {
   type: string;
   content?: unknown;
@@ -264,6 +286,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   let messageCount = 0;
   let lastUuid: string | null = null;
   const toolCallOwners = new Map<string, string>();
+  const seenUuids = new Map<string, number>();
 
   for (let index = 0; index < events.length; index++) {
     const event = events[index]!;
@@ -271,7 +294,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     // Provider ids are only unique inside a session: reasoning rows reuse
     // `rs_…` ids across conversations, and the messages table is keyed by uuid
     // alone, so an unprefixed id would overwrite a sibling session's row.
-    const uuid = `grok-${sid}-${typeof event.id === 'string' && event.id ? event.id : index}`;
+    const uuid = sessionUuid(sid, event.id, index, seenUuids);
 
     if (event.type === 'system') {
       const text = contentText(event.content);
@@ -406,17 +429,23 @@ function rawGrok(input: RawLookup): RawRecord | null {
   const sid = typeof input.session?.id === 'string' ? input.session.id : '';
   let found: string | null = null;
   let index = 0;
+  const seen = new Map<string, number>();
   readLines(transcriptPath, (line: string) => {
-    const rowIndex = index++;
     let parsed: any;
     try {
       parsed = JSON.parse(line);
     } catch {
       return; /* malformed transcript line */
     }
+    // parse() ignores rows that are not typed objects and numbers the rest from
+    // zero, so raw has to skip them too — otherwise every malformed line shifts
+    // the derived ids by one and a lookup silently returns a neighbouring row.
+    if (parsed === null || typeof parsed !== 'object' || typeof parsed.type !== 'string') return;
+    const rowIndex = index++;
     // Recompute the row's id with the same rule parse() used, including the
-    // session namespace, so a lookup cannot land on a sibling session's row.
-    const uuid = `grok-${sid}-${typeof parsed?.id === 'string' && parsed.id ? parsed.id : rowIndex}`;
+    // session namespace and the duplicate suffix, so a lookup cannot land on a
+    // sibling session's row.
+    const uuid = sessionUuid(sid, parsed.id, rowIndex, seen);
     const callIds: string[] = Array.isArray(parsed?.tool_calls)
       ? parsed.tool_calls
         .map((call: any) => (typeof call?.id === 'string' ? grokToolId(sid, call.id) : null))

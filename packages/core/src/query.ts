@@ -583,7 +583,12 @@ function createQueryApi(
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id);
     const chain: DbRow[] = [];
     let cur: DbRow | undefined = msg;
+    // A corrupt parent link (or a provider id reused inside one session) can
+    // point a row at itself; the walk must not trust the data to be acyclic.
+    const visited = new Set<string>([String(msg.uuid)]);
     while (cur?.parent_uuid) {
+      if (visited.has(String(cur.parent_uuid))) break;
+      visited.add(String(cur.parent_uuid));
       cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid);
       if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
     }
@@ -602,7 +607,13 @@ function createQueryApi(
     const chain: DbRow[] = [];
     let cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
     if (!isQueryableMessage(cur, includeInactive)) return chain;
+    const visited = new Set<string>();
     while (cur) {
+      const id = String(cur.uuid);
+      // Stop on a repeated row: parent links come from provider data, and a
+      // self-reference would otherwise loop forever.
+      if (visited.has(id)) break;
+      visited.add(id);
       if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
       cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined;
     }
