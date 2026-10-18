@@ -145,13 +145,15 @@ test('cursor: parse walks the blob DAG and projects messages, tool calls, and to
 
   const calls = values.filter((record) => record.kind === 'tool_call');
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].id, 'tool_1');
+  // `tool_1` is what Cursor mints for every store, and `tool_calls.id` is the
+  // primary key, so the call id has to carry its session.
+  assert.equal(calls[0].id, 'cursor-sid-1-tc-tool_1');
   assert.equal(calls[0].name, 'Read');
   assert.match(calls[0].input_json, /build\.log/);
 
   const results = values.filter((record) => record.kind === 'tool_result');
   assert.equal(results.length, 1);
-  assert.equal(results[0].tool_use_id, 'tool_1');
+  assert.equal(results[0].tool_use_id, 'cursor-sid-1-tc-tool_1');
   assert.match(results[0].content, /module not found/);
 
   const assistant = values.find((record) => record.kind === 'message' && record.type === 'assistant');
@@ -193,4 +195,24 @@ test('cursor: an unchanged store signature is skipped on the next discovery', ()
   const { cursor } = drain(provider.parse(unit, null));
   const next = provider.discover({ lastCursor: (key) => (key === dbPath ? cursor : null) });
   assert.equal(next.length, 0);
+});
+
+test('cursor: an out-of-range createdAt falls back to the store mtime instead of throwing', () => {
+  // The descriptor is hex-encoded JSON inside a SQLite row: a truncated or
+  // newer-Cursor write can put any number there. `new Date(1e20).toISOString()`
+  // throws RangeError, and a thrown unit aborts a strict (force) rebuild.
+  const root = makeTempDir('obelisk-cursor-time-');
+  writeStore(root, { sessionId: 'sid-time', descriptor: { createdAt: 1e20 } });
+  const provider = createCursorProvider({ rootDir: root });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+
+  const session = values.find((record) => record.kind === 'session');
+  assert.ok(session, 'the session is still projected');
+  assert.equal(Number.isFinite(Date.parse(session.started_at)), true);
+  assert.equal(Number.isFinite(Date.parse(session.ended_at)), true);
+  for (const record of values) {
+    if (record.kind !== 'message') continue;
+    assert.equal(Number.isFinite(Date.parse(record.timestamp)), true, `timestamp of ${record.uuid}`);
+  }
 });

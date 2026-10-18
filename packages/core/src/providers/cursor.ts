@@ -154,6 +154,21 @@ function acpMetadata(sessionDir: string): { cwd?: string; title?: string } {
   }
 }
 
+// Tool ids are only unique inside one store (`tool_1` is the common case), and
+// `tool_calls.id` is the table's primary key — an unprefixed id makes the second
+// store's call overwrite the first one's, taking its session with it.
+function cursorToolId(sessionId: string, callId: string): string {
+  return `cursor-${sessionId}-tc-${callId}`;
+}
+
+// Messages carry a provider id only sometimes; short ids are not trustworthy as
+// keys, so those rows fall back to their position in the decoded transcript.
+function messageUuidOf(sessionId: string, message: { id?: unknown }, index: number): string {
+  return typeof message.id === 'string' && message.id.length > 12
+    ? `cursor-${sessionId}-${message.id}`
+    : `cursor-${sessionId}-${index}`;
+}
+
 // `<db mtime>:<db size>:<wal mtime>`: WAL writes can land without touching the
 // main file's size, so the -wal timestamp participates too.
 function encodeCursor(storePath: string): string {
@@ -383,16 +398,23 @@ export function* parse(
   }
 
   const acp = kind === 'acp' ? acpMetadata(sessionDir) : {};
-  const baseMs = typeof descriptor?.createdAt === 'number' && Number.isFinite(descriptor.createdAt)
+  const storeStat = statSync(storePath);
+  // `createdAt` comes from a hex-encoded descriptor that can be truncated or
+  // written by a newer Cursor build; a value outside the Date representable
+  // range would throw from toISOString(), and a thrown unit fails the whole
+  // force rebuild (one strict transaction). Out-of-range falls back to mtime.
+  const createdMs = typeof descriptor?.createdAt === 'number'
+    && Number.isFinite(descriptor.createdAt)
+    && Math.abs(descriptor.createdAt) <= 8.64e15
     ? descriptor.createdAt
-    : statSync(storePath).mtimeMs;
-  const endedAt = new Date(statSync(storePath).mtimeMs).toISOString();
+    : storeStat.mtimeMs;
+  const endedAt = new Date(storeStat.mtimeMs).toISOString();
   // Cursor records only a session creation time. Per-message timestamps are
   // assigned as creation + ordinal so ordering is monotonic and every value
   // stays inside the session's own span; the adapter does not pretend to know
   // minute-level timing it never wrote down.
   let ordinal = 0;
-  const nextTimestamp = (): string => new Date(baseMs + ordinal++).toISOString();
+  const nextTimestamp = (): string => new Date(createdMs + ordinal++).toISOString();
 
   let projectPath = normalizeObservedCwd(acp.cwd);
   let title = typeof acp.title === 'string' && acp.title.trim() ? acp.title.trim() : null;
@@ -402,9 +424,7 @@ export function* parse(
 
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]!;
-    const uuid = typeof message.id === 'string' && message.id.length > 12
-      ? `cursor-${sid}-${message.id}`
-      : `cursor-${sid}-${index}`;
+    const uuid = messageUuidOf(sid, message, index);
     const role = typeof message.role === 'string' ? message.role : 'unknown';
 
     if (role === 'system') {
@@ -459,7 +479,7 @@ export function* parse(
       for (const block of blocks) {
         if (block?.type !== 'tool-call' || typeof block.toolCallId !== 'string') continue;
         yield {
-          kind: 'tool_call', id: block.toolCallId, message_uuid: uuid, session_id: sid,
+          kind: 'tool_call', id: cursorToolId(sid, block.toolCallId), message_uuid: uuid, session_id: sid,
           name: typeof block.toolName === 'string' ? block.toolName : '',
           presentation: block.toolName === 'Skill' ? 'skill' : 'default',
           input_json: truncJson(block.args ?? {}) as string,
@@ -475,7 +495,7 @@ export function* parse(
         if (block?.type !== 'tool-result' || typeof block.toolCallId !== 'string') continue;
         const output = toolResultText(block);
         yield {
-          kind: 'tool_result', tool_use_id: block.toolCallId,
+          kind: 'tool_result', tool_use_id: cursorToolId(sid, block.toolCallId),
           message_uuid: lastUuid ?? uuid, session_id: sid,
           content: trunc(output),
           file_path: null,
@@ -502,7 +522,7 @@ export function* parse(
   yield {
     kind: 'session', id: sid, title,
     project: projectSlugFromPath(projectPath) ?? unit.project ?? null,
-    started_at: new Date(baseMs).toISOString(), ended_at: endedAt,
+    started_at: new Date(createdMs).toISOString(), ended_at: endedAt,
     git_branch: null, version: null,
     message_count: messageCount, countMode: 'total',
     jsonl_path: storePath, source: name,
@@ -513,7 +533,7 @@ export function* parse(
     // pretending the session is empty.
     yield {
       kind: 'message', uuid: `cursor-${sid}-opaque`, session_id: sid, type: 'system',
-      parent_uuid: null, timestamp: new Date(baseMs).toISOString(), role: 'system',
+      parent_uuid: null, timestamp: new Date(createdMs).toISOString(), role: 'system',
       text: `[cursor] ${opaqueBlobs} opaque blob(s); transcript could not be decoded`,
       content_type: 'notice', is_meta: 1,
       visibility: 'hidden' as MessageVisibility, model: null, is_sidechain: 0, agent_id: null,
@@ -527,17 +547,25 @@ export function* parse(
 function rawCursor(input: RawLookup, openDatabase: CursorDatabaseOpener): RawRecord | null {
   const storePath = typeof input.session?.jsonl_path === 'string' ? input.session.jsonl_path : null;
   if (storePath === null || !existsSync(storePath)) return null;
+  const sid = typeof input.session?.id === 'string' ? input.session.id : '';
   const db = openSource(storePath, openDatabase);
   if (db === null) return null;
   try {
     const descriptor = descriptorOf(db);
     if (typeof descriptor?.latestRootBlobId !== 'string') return null;
     const walked = walkStore(db, descriptor.latestRootBlobId);
-    for (const message of walked.messages) {
+    for (let index = 0; index < walked.messages.length; index++) {
+      const message = walked.messages[index]!;
       const blocks = Array.isArray(message.content) ? message.content : [];
-      const matchesBlock = blocks.some((block) => block?.toolCallId === input.messageUuid);
-      const derivedMatch = input.messageUuid.startsWith(`cursor-`)
-        && input.messageUuid.endsWith(`-${walked.messages.indexOf(message)}`);
+      // Tool calls are looked up by their canonical id; the session prefix is
+      // part of it, so compare against the same derivation parse() emits.
+      const matchesBlock = blocks.some(
+        (block) => typeof block?.toolCallId === 'string'
+          && cursorToolId(sid, block.toolCallId) === input.messageUuid,
+      );
+      // Messages without a provider id are addressed by ordinal, so the id has
+      // to be rebuilt exactly — `endsWith('-3')` also matched `-13`.
+      const derivedMatch = messageUuidOf(sid, message, index) === input.messageUuid;
       if (!matchesBlock && !derivedMatch) continue;
       const text = JSON.stringify(message);
       return {
