@@ -496,10 +496,22 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const sessionsDir = rootDir;
   // Track every inventory problem: tombstones are destructive and may only
   // fire when the inventory is fully certified (CONTRIBUTING: fail closed).
-  let inventoryProblem = false;
+  let tombstonesUnsafe = false;
   const reportIssue = (issue: { path: string; error: string }) => {
-    inventoryProblem = true;
+    tombstonesUnsafe = true;
     ctx.reportIncompleteInventory?.(issue);
+  };
+  // A known path whose content this adapter version cannot project (an
+  // unsupported format version). The path itself is enumerated, so this is not
+  // an inventory gap: reporting it as one would withhold the provider marker and
+  // refuse every force publish, i.e. one newer-format file would block the whole
+  // index (ADR-0014 version gate; CONTRIBUTING: skip and record, never poison the
+  // provider). Tombstones stay disabled — a superseded twin of a skipped file is
+  // gone from disk, and retracting it would delete last-good rows we cannot yet
+  // rebuild.
+  const reportArtifactSkip = (issue: { path: string; error: string }) => {
+    tombstonesUnsafe = true;
+    ctx.reportSkippedArtifact?.(issue);
   };
   const rootProbe = probePath(sessionsDir);
   if (rootProbe === 'error') {
@@ -544,7 +556,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       || !Number.isInteger(formatVersion)
       || formatVersion < MIN_FORMAT_VERSION
       || formatVersion > MAX_FORMAT_VERSION) {
-      reportIssue({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
+      reportArtifactSkip({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
       unreadable.push(file);
       fileByPath.set(file.path, file);
       continue;
@@ -750,7 +762,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // Identity liveness is computed from ALL groups with a root member —
   // BEFORE the changed-path filter. A cross-directory move reported by the
   // watcher as only the OLD path must not tombstone the moved session.
-  const inventoryComplete = rootProbe === 'present' && !inventoryProblem;
+  const inventoryComplete = rootProbe === 'present' && !tombstonesUnsafe;
   const liveSessionIds = new Set(
     [...membersByRootKey.values()]
       .filter((group) => group.paths.some((path) => rawIdByPath.get(path) === group.rootRawId))

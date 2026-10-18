@@ -28,6 +28,7 @@ import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+import { runCli } from './cli-test-helpers.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
@@ -987,10 +988,16 @@ test('an unknown higher header version is skipped and recorded, never parsed as 
     JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'future' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
   ].join('\n') + '\n');
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.equal(units.length, 0);
-  assert.ok(issues.some((i) => i.error.includes('version 99')));
+  assert.ok(skipped.some((i) => i.error.includes('version 99')));
+  assert.deepEqual(issues, [], 'the artifact was enumerated, so it is a skip and not an inventory gap');
 });
 
 test('a permission-denied session dir is an inventory error, never a deletion', { skip: process.platform === 'win32' }, () => {
@@ -1576,7 +1583,7 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
 // The gate accepts 0–3 and nothing beyond: a version-4 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
 // provider — skip, record, and suppress the project directory.
-test('a version-4 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
+test('a version-4 header is rejected at the gate, recorded as a skipped artifact, and suppresses its whole project directory (fail closed)', () => {
   const dir = makeTempDir('obelisk-version4-');
   const sessionsDir = join(dir, 'sessions');
   // A v4 artifact (the first rejectable generation) beside a healthy v0
@@ -1601,12 +1608,20 @@ test('a version-4 header is rejected at the gate and suppresses its whole projec
   ].join('\n') + '\n');
 
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
   assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v4-session')),
     'the whole project directory is suppressed — no partial snapshot');
-  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 4'));
+  assert.ok(skipped.some((i) => i.error === 'Unsupported session format version 4'),
+    'the skipped artifact is recorded for the user');
+  assert.deepEqual(issues, [],
+    'the path was enumerated, so an unsupported version must not certify the inventory as incomplete');
 });
 
 // v1 was never shipped in a tagged release but is physically v0: the gate
@@ -1857,4 +1872,32 @@ test('nested run_code dispatches chain to the outer anchor; isError and error bo
   const bashResult = values.find((r) => r.kind === 'tool_result' && r.tool_use_id === bash.id);
   assert.equal(bashResult.is_error, 1, 'a settle event with only the error field still marks failure');
   assertCanonicalRoundTrip(provider, unit, values);
+});
+
+// The user-visible consequence of the gate (issue #228 follow-up): one
+// newer-format artifact in ~/.dsh must not make `obelisk --build` unpublishable
+// for every other provider on the machine.
+test('a version-4 artifact no longer blocks the whole force build: healthy projects publish and the skip is recorded', () => {
+  const home = makeTempDir('obelisk-deepseek-v4-build-');
+  const sessionsDir = join(home, '.dsh', 'sessions');
+  const writeSession = (project, name, file, header, text) => {
+    const dir = join(sessionsDir, project, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, file), [
+      JSON.stringify(header),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  };
+  writeSession('--tmp-dsh-future--', 'v4-session', 'session.v4.jsonl', { ...HEADER, version: 4, id: 'v4-session' }, 'from the future');
+  writeSession('--tmp-dsh-healthy--', 'healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session', cwd: '/tmp/dsh-healthy' }, 'healthy question');
+
+  const built = runCli(['--build'], { home, env: {} });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+  assert.deepEqual(JSON.parse(built.stdout), { ok: true, db: join(home, '.obelisk', 'obelisk.sqlite') });
+
+  const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  const ids = db.prepare("SELECT id FROM sessions WHERE source = 'deepseek' ORDER BY id").all().map((row) => row.id);
+  db.close();
+  assert.ok(ids.some((id) => id.includes('healthy-session')), 'the healthy project is indexed');
+  assert.ok(!ids.some((id) => id.includes('v4-session')), 'the unsupported artifact is never parsed as a known format');
 });
