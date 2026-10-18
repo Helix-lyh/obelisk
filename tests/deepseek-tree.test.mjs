@@ -1583,11 +1583,11 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
 // The gate accepts 0–3 and nothing beyond: a version-4 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
 // provider — skip, record, and suppress the project directory.
-test('a version-4 header is rejected at the gate, recorded as a skipped artifact, and suppresses its whole project directory (fail closed)', () => {
+test('a version-4 header is rejected at the gate and withholds only its own session directory', () => {
   const dir = makeTempDir('obelisk-version4-');
   const sessionsDir = join(dir, 'sessions');
   // A v4 artifact (the first rejectable generation) beside a healthy v0
-  // sibling in the SAME project directory.
+  // sibling in the SAME project directory, but a DIFFERENT session directory.
   const projectDir = join(sessionsDir, '--tmp-dsh-project--');
   const write = (name, file, header, text) => {
     const d = join(projectDir, name);
@@ -1616,8 +1616,10 @@ test('a version-4 header is rejected at the gate, recorded as a skipped artifact
     reportSkippedArtifact: (i) => skipped.push(i),
   });
   assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
-  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v4-session')),
-    'the whole project directory is suppressed — no partial snapshot');
+  assert.ok(!units.some((u) => u.sessionId.includes('v4-session')),
+    'the unreadable session directory is withheld — no partial snapshot');
+  assert.ok(units.some((u) => u.sessionId.includes('healthy-session')),
+    'a sibling session the v4 file does not touch is still indexed');
   assert.ok(skipped.some((i) => i.error === 'Unsupported session format version 4'),
     'the skipped artifact is recorded for the user');
   assert.deepEqual(issues, [],

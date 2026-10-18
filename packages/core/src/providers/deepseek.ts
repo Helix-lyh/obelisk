@@ -535,6 +535,9 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const headerByPath = new Map<string, DshHeader>();
   const rawIdByPath = new Map<string, string>();
   const unreadable: SessionFile[] = [];
+  // Known-newer formats are not corruption: the file is intact, we just cannot
+  // read it. They are tracked apart because the blast radius differs (below).
+  const unsupportedVersion: SessionFile[] = [];
   for (const file of files) {
     // A headerless artifact (header frame not yet flushed / corrupt) cannot
     // establish identity or scope — but excluding it from its tree would let a
@@ -557,7 +560,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       || formatVersion < MIN_FORMAT_VERSION
       || formatVersion > MAX_FORMAT_VERSION) {
       reportArtifactSkip({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
-      unreadable.push(file);
+      unsupportedVersion.push(file);
       fileByPath.set(file.path, file);
       continue;
     }
@@ -610,11 +613,19 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     group.paths = keptPaths;
   }
 
-  // An unreadable-but-present file cannot prove which tree it belongs to in a
-  // multi-tree project, so attaching it would be a guess. Instead suppress ALL
-  // trees sharing its project directory for this round (their cursors keep the
-  // last-good state) — never publish a partial tree.
+  // An unreadable-but-present file cannot prove which tree it belongs to, so
+  // every tree in its project is suppressed for this round (their cursors keep
+  // the last-good state) — never publish a partial tree.
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
+  // A known-newer artifact is different: it proves nothing about its siblings,
+  // and taking the whole project down with it is how a real corpus ended up
+  // with zero deepseek sessions — 1,144 v4 files suppressed 46 healthy ones
+  // that have no v4 twin at all. Its own session directory is still withheld,
+  // because the newer file may be a rewritten copy of that session.
+  const suppressedSessionDirs = new Set(unsupportedVersion.map((file) => dirname(file.path)));
+  const isSuppressed = (paths: readonly string[]): boolean => paths.some((path) =>
+    suppressedSessionDirs.has(dirname(path))
+    || suppressedProjectDirs.has(fileByPath.get(path)?.projectDir ?? ''));
 
   // ---- changed-path routing table ----
   // One canonicalization pass per changed path, one lookup per route
@@ -659,7 +670,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     const groupBySessionId = new Map<string, number>();
     groupList.forEach(([groupKey, group], i) => {
       if (divergentGroups.has(groupKey)) return;
-      if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) return;
+      if (isSuppressed(group.paths)) return;
       const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
       if (rootPath === undefined) return;
       groupBySessionId.set(canonicalDeepseekTreeSessionId(group.rootRawId, group.scope), i);
@@ -715,7 +726,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const units: IndexUnit[] = [];
   for (const [groupIndex, [groupKey, group]] of [...membersByRootKey.entries()].entries()) {
     if (divergentGroups.has(groupKey)) continue; // divergent copies: fail closed
-    if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) continue;
+    if (isSuppressed(group.paths)) continue;
     const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
     // The root file is gone (deleted) while children survive: this tree cannot
     // emit a valid session row, and promoting a child would publish a phantom
