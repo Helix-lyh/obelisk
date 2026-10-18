@@ -8,10 +8,12 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
   dropMessageFtsTriggers,
   ensureFtsReady,
   refreshSessionProjectPaths,
+  repairOrphanedSessionCounts,
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
@@ -423,6 +425,8 @@ function buildIndex({
           backfillUnresolvedSessionProjectPathsOnce(db);
         }
         healWorkflowParentLinks(db);
+        repairOrphanedSessionCounts(db);
+        backfillSessionTitles(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');
