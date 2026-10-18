@@ -89,8 +89,89 @@ export function refreshSessionProjectPaths(
   }
 }
 
-/** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */
-export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean {
+const SESSION_TITLE_MAX_CHARS = 80;
+// How many opening user messages to inspect before giving up on a title: the
+// first few records of a transcript are frequently runtime wrappers rather
+// than anything the person typed.
+const SESSION_TITLE_CANDIDATES = 5;
+
+// Blocks that describe the harness, not the session. `<command-name>/clear</command-name>`
+// is a slash command, `<user_info>` is the runtime's environment preamble, and
+// the rest are local-command plumbing.
+const WRAPPER_BLOCKS = [
+  'system-reminder', 'user_info', 'command-name', 'command-message', 'command-args',
+  'local-command-stdout', 'local-command-stderr',
+] as const;
+const AGENT_TYPE_PREFIX = /^\[[^\]]{1,40}\]\s*/;
+const WARMUP_PROMPT = /^warm ?up$/i;
+const HAS_WORD = /[\p{L}\p{N}]/u;
+
+/** A catalogue-sized title taken from a message body, or null when it is all plumbing. */
+function titleFromMessageText(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  let cleaned = text.trim().replace(AGENT_TYPE_PREFIX, '');
+  for (const tag of WRAPPER_BLOCKS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, 'gi'), ' ');
+  }
+  for (const rawLine of cleaned.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith('<') || WARMUP_PROMPT.test(line)) continue;
+    if (line.length < 3 || !HAS_WORD.test(line)) continue;
+    return line.length > SESSION_TITLE_MAX_CHARS
+      ? `${line.slice(0, SESSION_TITLE_MAX_CHARS - 1).trimEnd()}…`
+      : line;
+  }
+  return null;
+}
+
+/**
+ * Fill a missing catalogue title from the session's own first usable user message.
+ *
+ * Two kinds of session reach the index without a title: older Claude
+ * transcripts that never wrote a custom/ai title, and sessions reconstructed
+ * from orphaned subagent logs, which have no title source at all (see the
+ * claude adapter). They are browsable by id but indistinguishable in a list.
+ *
+ * Wrapper records are skipped rather than titled (`<command-name>/clear</command-name>`,
+ * `<user_info>` preambles, `Warmup` probes), and a session whose opening records
+ * are all plumbing stays untitled — a made-up title is worse than none. Only
+ * NULL/blank titles are filled, so a real title learned later still wins:
+ * persist writes provider titles with `r.title ?? prev?.title`.
+ */
+export function backfillSessionTitles(db: SqliteDb): number {
+  const candidates = db.prepare(`
+    WITH opening AS (
+      SELECT s.id AS session_id, m.text AS text,
+             ROW_NUMBER() OVER (
+               PARTITION BY s.id ORDER BY m.timestamp IS NULL, m.timestamp, m.uuid
+             ) AS rank
+      FROM sessions s
+      JOIN messages m ON m.session_id = s.id
+      WHERE (s.title IS NULL OR trim(s.title) = '')
+        AND m.role = 'user'
+        AND m.text IS NOT NULL
+        AND trim(m.text) <> ''
+    )
+    SELECT session_id, text FROM opening
+    WHERE rank <= ${SESSION_TITLE_CANDIDATES}
+    ORDER BY session_id, rank
+  `).all();
+  const update = db.prepare('UPDATE sessions SET title = ? WHERE id = ?');
+  const titled = new Set<string>();
+  let filled = 0;
+  for (const row of candidates) {
+    const id = String(row.session_id);
+    if (titled.has(id)) continue;
+    const title = titleFromMessageText(row.text);
+    if (title === null) continue;
+    update.run(title, id);
+    titled.add(id);
+    filled++;
+  }
+  return filled;
+}
+
+/** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean {
   const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
     .get(PROJECT_PATH_BACKFILL_MARKER);
   if (done) return false;
