@@ -101,6 +101,16 @@ same completed refresh. Pending replay also bypasses the changed-path filter.
 Malformed or unreadable headers still invalidate inventory and use the
 established project suppression.
 
+Retention matches current and checkpointed paths through the same physical-path
+canonicalization as watcher routing, including the longest existing ancestor for
+removed generations. Switching a configured source root between a symlink and
+its real directory must not detach historical ownership, even if an unsupported
+header changes scope. If an old alias was removed, a surviving root identity
+locates the current project for conservative protection. An indexed root with
+neither a surviving identity nor an accessible historical namespace is retained
+while future artifacts remain; its absence cannot be certified. Persisted unit
+keys remain unchanged.
+
 Historical paths/checkpoints identify candidate replaced roots, not deletion
 proof. Old identities may retire only when the complete current root census
 proves them absent everywhere; a live moved root is protected even if its old

@@ -641,9 +641,28 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // every tree in its project is suppressed for this round (their cursors keep
   // the last-good state) — never publish a partial tree.
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
+  // Compare physical paths for both retention and watcher routing, without
+  // changing opaque checkpoint keys. Resolve through the longest existing
+  // ancestor so deleted generations still match through a source-root alias.
+  const canon = (p: string): string => {
+    let current = p;
+    const missingTail: string[] = [];
+    for (;;) {
+      try {
+        const resolved = realpathSync(current);
+        return missingTail.length === 0 ? resolved : join(resolved, ...missingTail);
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return p;
+        missingTail.unshift(current.slice(parent.length + 1));
+        current = parent;
+      }
+    }
+  };
   // Close suppression over BOTH current and historical tree membership. A
   // member moved to a new root must not overwrite rows retained by its old root.
-  const blockedDirs = new Set(unsupportedVersion.map(file => dirname(file.path)));
+  const blockedDirs = new Set(unsupportedVersion.map(file => canon(dirname(file.path))));
+  const blockedProjects = new Set(unsupportedVersion.map(file => canon(dirname(dirname(file.path)))));
   const blockedMembers = new Set(unsupportedVersion.map(file =>
     canonicalDeepseekTreeSessionId(rawIdByPath.get(file.path)!, projectScope(headerByPath.get(file.path)!.cwd))));
   const retainedSessionIds = new Set<string>();
@@ -652,14 +671,27 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     paths: group.paths,
     members: group.paths.map(path => canonicalDeepseekTreeSessionId(rawIdByPath.get(path)!, group.scope)),
   }));
+  const currentPathsBySessionId = new Map(candidates.map(candidate => [candidate.id, candidate.paths]));
   const uncertainProjects = new Set<string>();
   for (const indexed of ctx.indexedSessions?.() ?? []) {
     const previous = ctx.previousCursor?.(indexed.jsonlPath) ?? ctx.lastCursor(indexed.jsonlPath);
     const state = decodeCursorState(previous);
     const paths = [indexed.jsonlPath, ...Object.keys(state?.members ?? {})];
-    if (state === null && unsupportedVersion.some(file => dirname(dirname(file.path)) === dirname(dirname(indexed.jsonlPath)))) {
-      // No historical member census: do not guess which old tree owned a child.
-      uncertainProjects.add(dirname(dirname(indexed.jsonlPath)));
+    if (blockedProjects.size > 0 && (state === null || probePath(dirname(dirname(indexed.jsonlPath))) !== 'present')) {
+      // Missing membership, or an old root alias that no longer resolves:
+      // physical ownership cannot be reconstructed. A surviving root identity
+      // can locate the current project, but cannot certify which child moved.
+      const currentPaths = currentPathsBySessionId.get(indexed.sessionId) ?? [];
+      if (currentPaths.length === 0 && probePath(dirname(dirname(dirname(indexed.jsonlPath)))) !== 'present') {
+        // No surviving identity or accessible historical source namespace can
+        // prove this old root absent; a future root may be its replacement.
+        blockedMembers.add(indexed.sessionId);
+      }
+      const possibleProjects = [indexed.jsonlPath, ...currentPaths]
+        .map(path => canon(dirname(dirname(path))));
+      for (const project of possibleProjects) {
+        if (blockedProjects.has(project)) uncertainProjects.add(project);
+      }
     }
     candidates.push({
       id: indexed.sessionId,
@@ -683,8 +715,9 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     }
     return selected;
   };
-  for (const candidate of candidates) {
-    if (candidate.paths.some(path => blockedDirs.has(dirname(path)) || uncertainProjects.has(dirname(dirname(path))))) {
+  for (const candidate of unsupportedVersion.length > 0 ? candidates : []) {
+    if (candidate.paths.some(path => blockedDirs.has(canon(dirname(path)))
+      || (uncertainProjects.size > 0 && uncertainProjects.has(canon(dirname(dirname(path))))))) {
       blockedMembers.add(candidate.id);
     }
   }
@@ -711,25 +744,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // A path that hits nothing — or any directory-level event — means we cannot
   // tell which trees were touched: reconcile all of them. Multiple trees may
   // share a project directory, so every map value is a SET of group indexes.
-  // Canonicalize via the longest EXISTING ancestor: a deleted or renamed-away
-  // path cannot be realpath'd itself, but its symlink aliases resolve through
-  // the deepest existing ancestor, so the link-spelled and realpath-spelled
-  // forms of the same missing path still converge.
-  const canon = (p: string): string => {
-    let current = p;
-    const missingTail: string[] = [];
-    for (;;) {
-      try {
-        const resolved = realpathSync(current);
-        return missingTail.length === 0 ? resolved : join(resolved, ...missingTail);
-      } catch {
-        const parent = dirname(current);
-        if (parent === current) return p;
-        missingTail.unshift(current.slice(parent.length + 1));
-        current = parent;
-      }
-    }
-  };
   type Routing = Set<number> | 'all';
   let routing: Routing | null = null;
   if (changed !== null && changedFiles !== null) {

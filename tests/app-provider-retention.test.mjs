@@ -3,11 +3,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts';
+import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
 import { buildIndex as buildAppIndex } from '../app/src/main/indexer.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { createQueryApi } from '../packages/core/src/query.ts';
@@ -239,6 +240,34 @@ test('the built CLI preserves last-good history and reports future artifacts on 
   assert.deepEqual(messagesAt(dbPath), before);
 });
 
+for (const command of ['query', 'search']) {
+  test(`CLI ${command} refresh reports future artifacts while returning last-good history`, () => {
+    const { home, project } = fixture();
+    const initial = runCli(['--build'], { home });
+    assert.equal(initial.status, 0, initial.stderr || initial.stdout);
+    const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+    const before = messagesAt(dbPath);
+    const future = publishFuture(project, 'v3-seeded-child');
+    appendHealthy(project);
+    const queryPath = join(home, 'query.mjs');
+    writeFileSync(queryPath, "return search('healthy sibling progressed');");
+    const db = new DatabaseSync(dbPath);
+    // Model a query after the recent-build debounce has elapsed, without a
+    // wall-clock sleep or changing transcript/checkpoint evidence.
+    db.prepare("UPDATE index_state SET mtime=0 WHERE jsonl_path='__last_build__'").run();
+    db.close();
+    const args = command === 'query' ? ['--query', queryPath] : ['--search', 'healthy sibling progressed'];
+    const result = runCli(args, { home });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const hits = JSON.parse(result.stdout);
+    assert.equal(hits.length, 1, 'the command actually refreshed and found the new sibling message');
+    assert.ok(result.stderr.includes(future));
+    assert.match(result.stderr, /Warning: skipped deepseek artifact .*Unsupported session format version 5/);
+    const after = messagesAt(dbPath);
+    assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), before);
+  });
+}
+
 for (const replacement of [false, true]) {
   test(`retention preserves tool rows, aggregates and searchable history (${replacement ? 'replacement' : 'in-place'})`, () => {
     const { home, project, provider } = fixture();
@@ -365,6 +394,94 @@ test('desktop replacement retains history with the production SQLite binding', (
   assert.deepEqual(messagesAt(target), before);
   assert.deepEqual(messagesAt(dbPath), before, 'the source connection is read-only');
 });
+
+for (const direction of ['alias to real', 'real to alias']) {
+  for (const mode of ['refresh', 'watch', 'force', 'replacement']) {
+    test(`changing a source path alias retains future-format child history (${direction}, ${mode})`, () => {
+      const { home, root, project } = fixture();
+      const alias = join(home, 'sessions-alias');
+      symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const [initialRoot, nextRoot] = direction === 'alias to real' ? [alias, root] : [root, alias];
+      const isolatedRoots = Object.fromEntries(createBuiltinProviderRegistry().catalog()
+        .map(provider => [provider.id, join(home, 'empty', provider.id)]));
+      const dbPath = join(home, 'index.sqlite');
+      const options = { dbPath, providerRoots: { ...isolatedRoots, deepseek: initialRoot } };
+      assert.equal(buildAppIndex(options).complete, true);
+      const before = messagesAt(dbPath);
+      assert.ok(before.some(row => row.agent_id !== null));
+      const future = publishFuture(project, 'v3-seeded-child', { cwd: '/future-scope' });
+      const oldChild = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+      // Replacement also covers a migration that removed the old generation.
+      if (mode === 'replacement') rmSync(oldChild);
+      const healthy = appendHealthy(project);
+      const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+      const nextOptions = { ...options, dbPath: target, providerRoots: { ...isolatedRoots, deepseek: nextRoot } };
+      const result = buildAppIndex({
+        ...nextOptions,
+        force: mode === 'force' || mode === 'replacement',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : {}),
+        ...(mode === 'watch' ? { changedPaths: [future, healthy] } : {}),
+      });
+      assert.equal(result.complete, true);
+      assert.equal(result.skipped, 1);
+      const after = messagesAt(target);
+      assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), before,
+        'the full last-good tree survives either spelling of the same source');
+      assert.equal(after.filter(row => row.text === 'healthy sibling progressed').length, 1,
+        'retention must not suppress the healthy sibling');
+      if (mode === 'replacement') assert.deepEqual(messagesAt(dbPath), before);
+      if (mode === 'replacement') cpSync(join(FIXTURES, 'v3-seeded-child', 'session.v3.jsonl'), oldChild);
+      rmSync(future);
+      const recovered = buildAppIndex(nextOptions);
+      assert.equal(recovered.complete, true);
+      assert.equal(recovered.skipped, 0);
+      assert.deepEqual(messagesAt(target), after, 'recovery does not duplicate or lose messages');
+    });
+  }
+}
+
+test('a source alias still protects the project when historical membership is unavailable', () => {
+  const { home, root, project } = fixture();
+  const alias = join(home, 'sessions-alias');
+  symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, providerRegistry: createProviderRegistry([createDeepseekProvider({ rootDir: alias })]) };
+  assert.equal(buildAppIndex(options).complete, true);
+  const before = messagesAt(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.prepare('UPDATE index_state SET cursor=NULL WHERE jsonl_path=?')
+    .run(join(alias, '--dsh-v3--', 'v3-seeded-parent', 'session.v3.jsonl'));
+  db.close();
+  publishFuture(project, 'v3-seeded-child', { cwd: '/future-scope' });
+  const result = buildAppIndex({
+    ...options, force: true,
+    providerRegistry: createProviderRegistry([createDeepseekProvider({ rootDir: root })]),
+  });
+  assert.equal(result.complete, true);
+  assert.equal(result.skipped, 1);
+  assert.deepEqual(messagesAt(dbPath), before, 'unknown historical ownership uses the same physical project');
+});
+
+for (const futureSession of ['v3-seeded-child', 'v3-seeded-parent', 'v3-ptc']) {
+  test(`removing an old source alias preserves the last-good tree (${futureSession})`, () => {
+    const { home, root, project } = fixture();
+    const alias = join(home, 'sessions-alias');
+    symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, providerRegistry: createProviderRegistry([createDeepseekProvider({ rootDir: alias })]) };
+    assert.equal(buildAppIndex(options).complete, true);
+    const before = messagesAt(dbPath);
+    publishFuture(project, futureSession, { cwd: '/future-scope' });
+    rmSync(alias);
+    const result = buildAppIndex({
+      ...options, force: true,
+      providerRegistry: createProviderRegistry([createDeepseekProvider({ rootDir: root })]),
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.skipped, 1);
+    assert.deepEqual(messagesAt(dbPath), before, 'an unresolvable historical namespace needs conservative retention');
+  });
+}
 
 test('replay retracts the old root identity using historical evidence', () => {
   const { home, project, provider } = fixture();
