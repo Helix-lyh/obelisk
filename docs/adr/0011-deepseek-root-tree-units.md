@@ -85,3 +85,30 @@ entirely.
 - Packed chunk rows are not expanded during projection (their content
   duplicates the step-final `assistant/message`); the vendored codec stays
   available for raw reconstruction but is not on the indexing path.
+
+
+**Amendment (2026-10-20): future members retain their whole tree.** A readable
+future-format identity envelope participates in ancestry discovery but its body
+never reaches projection. An unsupported member retains the complete root tree,
+not just its physical session directory. Discovery closes that decision over
+both the current graph and checkpointed members, so another tree cannot adopt a
+member and overwrite retained rows. If historical ownership is unavailable,
+project-local protection is conservative; unrelated proven deletions remain
+eligible when the identity census is otherwise complete. The same current and
+historical ownership closure expands watcher invalidation on recovery, so an
+old owner cannot retract a member without its new owner being projected in the
+same completed refresh. Pending replay also bypasses the changed-path filter.
+Malformed or unreadable headers still invalidate inventory and use the
+established project suppression.
+
+Historical paths/checkpoints identify candidate replaced roots, not deletion
+proof. Old identities may retire only when the complete current root census
+proves them absent everywhere; a live moved root is protected even if its old
+directory is reused. Retirement records are buffered inside parse after member
+and seed validation, never eager `IndexUnit.retractSessionIds` on a replacement.
+Force, canonical-marker replay, and pending replay of an indexed identity set
+`snapshotRequired`; an unavailable member, changed header, or undurable seed
+fails that projection instead of committing a cursor-only no-op after
+destructive cleanup or reporting unfinished recovery as complete. Ordinary
+incremental no-op guards retain their existing fail-closed behavior and cannot
+emit a buffered retirement.

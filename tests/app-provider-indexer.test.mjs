@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
 import { buildIndex } from '../app/src/main/indexer.ts';
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
@@ -378,7 +379,9 @@ test('marker replay invalidates provider unit keys that differ from source paths
   incomplete = true;
   assert.equal(buildIndex(options).complete, false);
   db = new TestDatabase(dbPath);
-  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(unitKey).c, 0);
+  assert.equal(storedProviderCursor(db, unitKey), null, 'the old checkpoint cannot resume projection');
+  assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(unitKey).replay_required, 1);
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(unitKey).cursor, '10:1', 'historical identity evidence survives invalidation');
   db.close();
 
   incomplete = false;

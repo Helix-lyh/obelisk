@@ -1,0 +1,474 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { appendFileSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts';
+import { buildIndex as buildAppIndex } from '../app/src/main/indexer.ts';
+import { runCli } from './cli-test-helpers.mjs';
+import { createQueryApi } from '../packages/core/src/query.ts';
+import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { persist } from '../packages/core/src/persist.ts';
+import { makeTempDir } from './temp-dirs.mjs';
+
+const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+const FIXTURES = fileURLToPath(new URL('./fixtures/deepseek/sessions/--dsh-v3--', import.meta.url));
+
+function fixture() {
+  const home = makeTempDir('obelisk-retained-tree-');
+  const root = join(home, '.dsh', 'sessions');
+  const project = join(root, '--dsh-v3--');
+  mkdirSync(project, { recursive: true });
+  for (const name of ['v3-seeded-parent', 'v3-seeded-child', 'v3-basic', 'v3-ptc']) {
+    cpSync(join(FIXTURES, name), join(project, name), { recursive: true });
+  }
+  const provider = createDeepseekProvider({ rootDir: root });
+  return { home, root, project, provider };
+}
+
+// The unknown generation is a controlled mutation of real writer output. Its
+// body must never reach projection; the old generation remains beside it.
+function publishFuture(project, name, changes = {}) {
+  const path = join(project, name, 'session.v5.jsonl');
+  const previous = join(project, name, 'session.v3.jsonl');
+  const [first, ...body] = readFileSync(previous, 'utf8').trimEnd().split('\n');
+  writeFileSync(path, [JSON.stringify({ ...JSON.parse(first), version: 5, ...changes }), ...body].join('\n') + '\n');
+  return path;
+}
+
+for (const watch of [false, true]) {
+  test(`a newer child retains the complete last-good tree while a healthy sibling publishes (${watch ? 'watch' : 'refresh'})`, () => {
+    const { project, provider } = fixture();
+    const db = new DatabaseSync(':memory:');
+    db.exec(SCHEMA);
+    try {
+      const cursors = new Map();
+      const initial = provider.discover({ lastCursor: () => null });
+      for (const unit of initial) cursors.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+      const parent = initial.find(unit => unit.key.includes('v3-seeded-parent'));
+      assert.ok(parent);
+      const before = db.prepare('SELECT uuid, text, agent_id FROM messages WHERE session_id=? ORDER BY uuid').all(parent.sessionId);
+      assert.ok(before.some(row => row.agent_id !== null), 'the real seeded child contributed rows');
+      const changed = publishFuture(project, 'v3-seeded-child');
+      const retained = [];
+      const skipped = [];
+      const units = provider.discover({
+        lastCursor: key => cursors.get(key) ?? null,
+        ...(watch ? { changedPaths: [changed] } : {}),
+        indexedSessions: () => initial.map(unit => ({ sessionId: unit.sessionId, jsonlPath: unit.key })),
+        retainSession: id => retained.push(id),
+        reportSkippedArtifact: issue => skipped.push(issue),
+      });
+      assert.ok(!units.some(unit => unit.sessionId === parent.sessionId), 'an incomplete tree must never be projected');
+      assert.ok(retained.includes(parent.sessionId), 'last-good retention is explicit in discovery');
+      assert.equal(skipped.length, 1);
+      for (const unit of units) persist(db, unit, provider.parse(unit, cursors.get(unit.key) ?? null));
+      assert.deepEqual(db.prepare('SELECT uuid, text, agent_id FROM messages WHERE session_id=? ORDER BY uuid').all(parent.sessionId), before);
+    } finally { db.close(); }
+  });
+}
+
+class TestDatabase {
+  constructor(path) { this.db = new DatabaseSync(path); }
+  get inTransaction() { return this.db.isTransaction; }
+  pragma(sql) { this.db.exec(`PRAGMA ${sql}`); }
+  exec(sql) { return this.db.exec(sql); }
+  prepare(sql) { return this.db.prepare(sql); }
+  close() { this.db.close(); }
+}
+
+function messagesAt(path) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try { return db.prepare('SELECT * FROM messages ORDER BY uuid').all(); }
+  finally { db.close(); }
+}
+
+for (const replacement of [false, true]) {
+  test(`force rebuild preserves last-good trees and publishes healthy siblings (${replacement ? 'replacement database' : 'same database'})`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'old.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    assert.equal(buildAppIndex(options).complete, true);
+    const before = messagesAt(dbPath);
+    assert.ok(before.length > 0);
+    publishFuture(project, 'v3-seeded-child');
+    const target = replacement ? join(home, 'replacement.sqlite') : dbPath;
+    const result = buildAppIndex({ ...options, dbPath: target, force: true, ...(replacement ? { preserveDbPath: dbPath } : {}) });
+    assert.equal(result.complete, true);
+    assert.deepEqual(messagesAt(target), before, 'force publication retains every last-good message');
+    assert.equal(result.skipped, 1);
+    assert.match(result.skippedFiles[0].error, /Unsupported session format version 5/);
+  });
+}
+
+test('a retained tree cannot lose a member to another tree during a future-format transition', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const before = messagesAt(dbPath);
+  publishFuture(project, 'v3-seeded-parent');
+  const child = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+  const [header, ...body] = readFileSync(child, 'utf8').trimEnd().split('\n');
+  writeFileSync(child, [JSON.stringify({ ...JSON.parse(header), parentSession: 'v3-basic' }), ...body].join('\n') + '\n');
+  const result = buildAppIndex({ ...options, force: true });
+  assert.equal(result.complete, true);
+  assert.deepEqual(messagesAt(dbPath), before, 'a shared member must not overwrite last-good retained rows');
+});
+
+
+test('retained checkpoints survive marker replay and restart without certifying projection', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  const oldRegistry = createProviderRegistry([{ ...provider, indexVersionMarker: '__deepseek_canonical_transcript_v4__' }]);
+  buildAppIndex({ ...options, providerRegistry: oldRegistry });
+  const before = messagesAt(dbPath);
+  const future = publishFuture(project, 'v3-seeded-child', { id: 'changed-future-child', parentSession: 'unknown-root', cwd: '/future-cwd' });
+  for (let restart = 0; restart < 2; restart++) {
+    assert.equal(buildAppIndex(options).complete, true);
+    assert.deepEqual(messagesAt(dbPath), before);
+    const db = new DatabaseSync(dbPath);
+    const parentPath = join(project, 'v3-seeded-parent', 'session.v3.jsonl');
+    assert.equal(storedProviderCursor(db, parentPath), null);
+    assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(parentPath).replay_required, 1);
+    assert.ok(db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path=?').get(provider.indexVersionMarker));
+    db.close();
+  }
+  rmSync(future);
+  assert.equal(buildAppIndex(options).complete, true);
+  assert.deepEqual(messagesAt(dbPath), before, 'recovered source replays without duplicating usage or rows');
+  const db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(join(project, 'v3-seeded-parent', 'session.v3.jsonl')).replay_required, 0);
+  db.close();
+});
+
+test('pending replay remains incomplete until a recovered seed is durable', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  assert.equal(buildAppIndex(options).complete, true);
+  const before = messagesAt(dbPath);
+  const future = publishFuture(project, 'v3-seeded-parent');
+  assert.equal(buildAppIndex({ ...options, changedPaths: [future] }).complete, true);
+  const child = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+  const durableChild = readFileSync(child, 'utf8');
+  rmSync(future);
+  writeFileSync(child, durableChild.split('\n')[0] + '\n');
+  for (const extra of [{ changedPaths: [future] }, {}]) {
+    const result = buildAppIndex({ ...options, ...extra });
+    assert.equal(result.complete, false, 'pending replay cannot certify a header-only child');
+    assert.deepEqual(messagesAt(dbPath), before);
+    const db = new DatabaseSync(dbPath);
+    const state = db.prepare('SELECT cursor, replay_required FROM index_state WHERE jsonl_path=?')
+      .get(join(project, 'v3-seeded-parent', 'session.v3.jsonl'));
+    assert.ok(state.cursor, 'historical membership remains available for retry');
+    assert.equal(state.replay_required, 1);
+    db.close();
+  }
+  writeFileSync(child, durableChild);
+  assert.equal(buildAppIndex(options).complete, true);
+  assert.deepEqual(messagesAt(dbPath), before);
+});
+
+test('a future artifact does not prevent proven deletion of an unrelated indexed tree', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  publishFuture(project, 'v3-seeded-child');
+  rmSync(join(project, 'v3-basic'), { recursive: true });
+  assert.equal(buildAppIndex(options).complete, true);
+  const rows = messagesAt(dbPath);
+  assert.ok(rows.some(row => row.agent_id !== null), 'the retained child stays visible');
+  assert.ok(!rows.some(row => row.uuid.includes('v3-basic')), 'the unrelated deleted tree is retracted');
+  rmSync(join(project, 'v3-seeded-parent'), { recursive: true });
+  rmSync(join(project, 'v3-seeded-child'), { recursive: true });
+  assert.equal(buildAppIndex(options).complete, true);
+  assert.ok(messagesAt(dbPath).every(row => row.uuid.includes('v3-ptc')));
+});
+
+
+function appendHealthy(project) {
+  const path = join(project, 'v3-ptc', 'session.v3.jsonl');
+  const records = readFileSync(path, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line));
+  appendFileSync(path, JSON.stringify({
+    type: 'user/message', seq: Math.max(...records.map(record => record.seq ?? -1)) + 1,
+    time: 2000, data: { id: 'healthy-progress', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'healthy sibling progressed' }] },
+    surfaceOp: 'append',
+  }) + '\n');
+  return path;
+}
+
+for (const force of [false, true]) {
+  test(`healthy siblings progress and discovery skips remain visible (${force ? 'force' : 'watch'})`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    buildAppIndex(options);
+    const future = publishFuture(project, 'v3-seeded-child');
+    const healthy = appendHealthy(project);
+    const result = buildAppIndex({ ...options, force, changedPaths: [future, healthy] });
+    assert.equal(result.complete, true);
+    assert.equal(result.skipped, 1);
+    assert.equal(result.skippedFiles[0].path, future);
+    const db = new DatabaseSync(dbPath);
+    assert.equal(createQueryApi(db).search('healthy sibling progressed').length, 1);
+    assert.ok(db.prepare('SELECT uuid FROM messages WHERE agent_id IS NOT NULL').get());
+    db.close();
+  });
+}
+
+test('the built CLI preserves last-good history and reports future artifacts on stderr', () => {
+  const { home, project } = fixture();
+  let built = runCli(['--build'], { home });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const before = messagesAt(dbPath);
+  const future = publishFuture(project, 'v3-seeded-child');
+  built = runCli(['--build'], { home });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+  assert.deepEqual(JSON.parse(built.stdout), { ok: true, db: dbPath });
+  assert.ok(built.stderr.includes(future));
+  assert.match(built.stderr, /Unsupported session format version 5/);
+  assert.deepEqual(messagesAt(dbPath), before);
+});
+
+for (const replacement of [false, true]) {
+  test(`retention preserves tool rows, aggregates and searchable history (${replacement ? 'replacement' : 'in-place'})`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    buildAppIndex(options);
+    const canonical = path => {
+      const db = new DatabaseSync(path);
+      try {
+        return Object.fromEntries(['messages', 'tool_calls', 'tool_results', 'sessions', 'summaries', 'subagents', 'workflows', 'workflow_agents']
+          .map(table => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+      } finally { db.close(); }
+    };
+    const before = canonical(dbPath);
+    assert.ok(before.tool_calls.length > 0 && before.tool_results.length > 0);
+    publishFuture(project, 'v3-ptc');
+    const target = replacement ? join(home, 'replacement.sqlite') : dbPath;
+    const result = buildAppIndex({ ...options, dbPath: target, force: true, ...(replacement ? { preserveDbPath: dbPath } : {}) });
+    assert.equal(result.complete, true);
+    // Compare canonical values, independent of storage row order for rebuilt siblings.
+    const order = rows => rows.map(row => JSON.stringify(row)).sort();
+    const after = canonical(target);
+    for (const table of Object.keys(before)) assert.deepEqual(order(after[table]), order(before[table]), table);
+    const db = new DatabaseSync(target);
+    assert.equal(createQueryApi(db).search('run the ptc script').length, 1);
+    db.close();
+  });
+}
+
+for (const version of [null, '4', -1, 1.5, { invalid: true }]) {
+  test(`a malformed version ${JSON.stringify(version)} cannot certify a replacement snapshot`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    buildAppIndex(options);
+    const before = messagesAt(dbPath);
+    publishFuture(project, 'v3-seeded-child', { version });
+    const result = buildAppIndex({ ...options, force: true });
+    assert.equal(result.complete, false);
+    assert.equal(result.reason, 'incomplete_snapshot');
+    assert.match(result.inventoryIssues[0].error, /Malformed session header/);
+    assert.deepEqual(messagesAt(dbPath), before);
+  });
+}
+
+test('a fresh database publishes healthy siblings without a partial future-format tree', () => {
+  const { home, project, provider } = fixture();
+  publishFuture(project, 'v3-seeded-child');
+  const dbPath = join(home, 'index.sqlite');
+  const result = buildAppIndex({ dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]), force: true });
+  assert.equal(result.complete, true);
+  assert.equal(result.skipped, 1);
+  const rows = messagesAt(dbPath);
+  assert.ok(rows.length > 0);
+  assert.ok(rows.every(row => !row.uuid.includes('v3-seeded-')));
+});
+
+test('a failed force publication rolls back both retained history and rebuilt siblings', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const before = messagesAt(dbPath);
+  publishFuture(project, 'v3-seeded-child');
+  const failing = { ...provider, *parse(unit, cursor) {
+    const next = yield* provider.parse(unit, cursor);
+    throw new Error(`injected publication failure after ${next}`);
+  } };
+  const result = buildAppIndex({ ...options, force: true, providerRegistry: createProviderRegistry([failing]) });
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, 'provider_failure');
+  assert.equal(result.skipped, 2, 'both the discovery skip and failed unit are reported');
+  assert.deepEqual(messagesAt(dbPath), before);
+  assert.equal(buildAppIndex({ ...options, force: true }).complete, true);
+  assert.deepEqual(messagesAt(dbPath), before, 'restarting the complete publication converges');
+});
+
+test('an unavailable sessions root cannot delete last-good trees', () => {
+  const { home, root, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const before = messagesAt(dbPath);
+  rmSync(root, { recursive: true });
+  assert.equal(buildAppIndex(options).complete, false);
+  assert.equal(buildAppIndex({ ...options, force: true }).complete, false);
+  assert.deepEqual(messagesAt(dbPath), before);
+});
+
+test('watch recovery replays every current and historical owner before publishing', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const before = messagesAt(dbPath);
+  const childPath = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+  const [header, ...body] = readFileSync(childPath, 'utf8').trimEnd().split('\n');
+  const future = publishFuture(project, 'v3-seeded-parent');
+  writeFileSync(childPath, [JSON.stringify({ ...JSON.parse(header), parentSession: 'v3-basic' }), ...body].join('\n') + '\n');
+  buildAppIndex({ ...options, changedPaths: [future, childPath] });
+  assert.deepEqual(messagesAt(dbPath), before);
+  rmSync(future);
+  assert.equal(buildAppIndex({ ...options, changedPaths: [future] }).complete, true);
+  const after = messagesAt(dbPath);
+  const childRows = after.filter(row => row.agent_id !== null);
+  assert.equal(childRows.length, before.filter(row => row.agent_id !== null).length);
+  assert.ok(childRows.every(row => row.session_id.includes('v3-basic')), 'the new owner is projected in the same recovery');
+  const snapshotPath = join(home, 'fresh.sqlite');
+  buildAppIndex({ ...options, dbPath: snapshotPath, force: true });
+  assert.deepEqual(after, messagesAt(snapshotPath), 'watch recovery equals a complete source snapshot');
+});
+
+test('desktop replacement retains history with the production SQLite binding', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'old.sqlite');
+  const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+  assert.equal(buildAppIndex(options).complete, true);
+  const before = messagesAt(dbPath);
+  publishFuture(project, 'v3-seeded-child');
+  const target = join(home, 'replacement.sqlite');
+  const result = buildAppIndex({ ...options, dbPath: target, preserveDbPath: dbPath, force: true });
+  assert.equal(result.complete, true);
+  assert.equal(result.skipped, 1);
+  assert.deepEqual(messagesAt(target), before);
+  assert.deepEqual(messagesAt(dbPath), before, 'the source connection is read-only');
+});
+
+test('replay retracts the old root identity using historical evidence', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const future = publishFuture(project, 'v3-ptc');
+  buildAppIndex(options);
+  rmSync(future);
+  const root = join(project, 'v3-ptc', 'session.v3.jsonl');
+  const [header, ...body] = readFileSync(root, 'utf8').trimEnd().split('\n');
+  writeFileSync(root, [JSON.stringify({ ...JSON.parse(header), id: 'renamed-root' }), ...body].join('\n') + '\n');
+  assert.equal(buildAppIndex({ ...options, changedPaths: [future] }).complete, true);
+  const db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare("SELECT count(*) n FROM sessions WHERE id LIKE 'deepseek:v3-ptc:%'").get().n, 0);
+  assert.equal(db.prepare("SELECT count(*) n FROM sessions WHERE id LIKE 'deepseek:renamed-root:%'").get().n, 1);
+  db.close();
+  const snapshotPath = join(home, 'fresh.sqlite');
+  buildAppIndex({ ...options, dbPath: snapshotPath, force: true });
+  assert.deepEqual(messagesAt(dbPath), messagesAt(snapshotPath));
+});
+
+for (const mode of ['refresh', 'force', 'marker replay']) {
+  test(`moving a live identity and reusing its old directory preserves both roots (${mode})`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    const seed = mode === 'marker replay' ? { ...options, providerRegistry: createProviderRegistry([{ ...provider, indexVersionMarker: '__deepseek_canonical_transcript_v4__' }]) } : options;
+    buildAppIndex(seed);
+    const old = join(project, 'v3-ptc');
+    renameSync(old, join(project, 'a-moved'));
+    cpSync(join(FIXTURES, 'v3-ptc'), old, { recursive: true });
+    const path = join(old, 'session.v3.jsonl');
+    const [header, ...body] = readFileSync(path, 'utf8').trimEnd().split('\n');
+    writeFileSync(path, [JSON.stringify({ ...JSON.parse(header), id: 'replacement-root' }), ...body].join('\n') + '\n');
+    assert.equal(buildAppIndex({ ...options, force: mode === 'force' }).complete, true);
+    const db = new DatabaseSync(dbPath);
+    assert.equal(db.prepare("SELECT count(*) n FROM sessions WHERE id LIKE 'deepseek:v3-ptc:%'").get().n, 1);
+    assert.equal(db.prepare("SELECT count(*) n FROM sessions WHERE id LIKE 'deepseek:replacement-root:%'").get().n, 1);
+    db.close();
+    const fresh = join(home, 'fresh.sqlite');
+    buildAppIndex({ ...options, dbPath: fresh, force: true });
+    assert.deepEqual(messagesAt(dbPath), messagesAt(fresh));
+  });
+}
+
+for (const force of [false, true]) {
+  test(`an identity race after discovery preserves last-good until a stable retry (${force ? 'force' : 'marker replay'})`, () => {
+    const { home, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+    buildAppIndex({ ...options, providerRegistry: createProviderRegistry([{ ...provider, indexVersionMarker: '__deepseek_canonical_transcript_v4__' }]) });
+    const before = messagesAt(dbPath);
+    const path = join(project, 'v3-ptc', 'session.v3.jsonl');
+    const [header, ...body] = readFileSync(path, 'utf8').trimEnd().split('\n');
+    writeFileSync(path, [JSON.stringify({ ...JSON.parse(header), id: 'replacement-root' }), ...body].join('\n') + '\n');
+    let raced = false;
+    const racy = { ...provider, *parse(unit, cursor) {
+      if (!raced && unit.key === path) {
+        raced = true;
+        writeFileSync(path, [JSON.stringify({ ...JSON.parse(header), id: 'raced-root' }), ...body].join('\n') + '\n');
+      }
+      return yield* provider.parse(unit, cursor);
+    } };
+    const result = buildAppIndex({ ...options, force, providerRegistry: createProviderRegistry([racy]) });
+    assert.equal(result.complete, false);
+    assert.equal(result.skipped, 1);
+    assert.match(result.skippedFiles[0].error, /changed after discovery/);
+    assert.deepEqual(messagesAt(dbPath), before);
+    assert.equal(buildAppIndex({ ...options, force }).complete, true);
+    const fresh = join(home, 'fresh.sqlite');
+    buildAppIndex({ ...options, dbPath: fresh, force: true });
+    assert.deepEqual(messagesAt(dbPath), messagesAt(fresh));
+  });
+}
+
+test('a not-yet-durable seed cannot replace an existing force snapshot', () => {
+  const { home, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
+  buildAppIndex(options);
+  const before = messagesAt(dbPath);
+  const path = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+  const original = readFileSync(path, 'utf8');
+  writeFileSync(path, original.split('\n', 1)[0] + '\n');
+  const result = buildAppIndex({ ...options, force: true });
+  assert.equal(result.complete, false);
+  assert.match(result.skippedFiles[0].error, /Seed marker is not durable/);
+  assert.deepEqual(messagesAt(dbPath), before);
+  writeFileSync(path, original);
+  assert.equal(buildAppIndex({ ...options, force: true }).complete, true);
+  assert.deepEqual(messagesAt(dbPath), before);
+});
+
+test('v4 tool failures remain visible beside an unsupported v5 tree', () => {
+  const { home, root, project, provider } = fixture();
+  const v4 = fileURLToPath(new URL('./fixtures/deepseek/sessions/--dsh-v4--/v4-failed-tool', import.meta.url));
+  cpSync(v4, join(root, '--dsh-v4--', 'v4-failed-tool'), { recursive: true });
+  publishFuture(project, 'v3-seeded-child');
+  const dbPath = join(home, 'index.sqlite');
+  const result = buildAppIndex({ dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]), force: true });
+  assert.equal(result.complete, true);
+  assert.equal(result.skipped, 1);
+  const db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare("SELECT count(*) n FROM tool_results WHERE is_error=1 AND session_id LIKE 'deepseek:v4-%'").get().n, 1);
+  db.close();
+});

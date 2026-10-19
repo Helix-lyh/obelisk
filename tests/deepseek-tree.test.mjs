@@ -1584,7 +1584,7 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
 // The gate accepts 0–4 and nothing beyond: a version-5 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
 // provider — skip and record, withhold the affected tree, preserve siblings.
-test('a version-5 header is rejected at the gate and withholds only its own session directory', () => {
+test('a version-5 header withholds its tree while healthy sibling sessions stay live', () => {
   const dir = makeTempDir('obelisk-version5-');
   const sessionsDir = join(dir, 'sessions');
   // A v5 artifact (the first rejectable generation) beside a healthy v0

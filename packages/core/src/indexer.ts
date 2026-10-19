@@ -3,6 +3,7 @@
 
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
+import { prepareRetainedSnapshot } from './snapshot.ts';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
   backfillUnresolvedSessionProjectPathsOnce,
@@ -234,15 +235,10 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       }
 
       if (force) {
+        const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
         try {
           runRetryableWriteTransaction(txDb, () => {
-            // A force build publishes one complete source snapshot or nothing.
-            // The provider contract reserves no key prefix. A force snapshot
-            // recreates every unit cursor, provider marker, and system marker.
-            db.prepare('DELETE FROM index_state').run();
-            for (const table of ['messages', 'tool_calls', 'tool_results', 'sessions', 'summaries', 'subagents', 'workflows', 'workflow_agents']) {
-              db.prepare(`DELETE FROM ${table}`).run();
-            }
+            snapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
@@ -262,7 +258,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               reason: 'database_busy',
               incompleteProviders,
               inventoryIssues,
-              skipped: 0,
+              skipped: skippedFiles.length,
               skippedFiles,
             };
           }
@@ -288,6 +284,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             };
           }
           throw error;
+        } finally {
+          snapshot.close();
         }
         return {
           skip: false,

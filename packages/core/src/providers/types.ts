@@ -58,12 +58,19 @@ export interface InventoryIssue {
 
 /** Context the orchestration provides to discovery. */
 export interface DiscoverContext {
+  /** Require a complete projection: an unstable unit must fail, not return a no-op. */
+  snapshotRequired?: boolean;
   /** Look up the cursor persisted for a unit key on a previous run. */
   lastCursor(key: string): Cursor;
   /** When set (daemon changed-path mode), restrict discovery to these paths. */
   changedPaths?: string[];
   /** Sessions already indexed for this provider, keyed by their canonical source path. */
   indexedSessions?(): readonly IndexedSession[];
+  /** Historical checkpoint for identity/membership evidence, even during replay.
+   * Unlike lastCursor, this must never be used to skip or resume projection. */
+  previousCursor?(key: string): Cursor;
+  /** Keep this indexed canonical session unchanged when it cannot be rebuilt. */
+  retainSession?(sessionId: string): void;
   /** Report that the source inventory could not be enumerated completely. */
   reportIncompleteInventory?(issue?: InventoryIssue): void;
   /**
@@ -71,10 +78,9 @@ export interface DiscoverContext {
    * version cannot project (for example a session file carrying a format
    * version newer than the adapter supports).
    *
-   * This is NOT an incomplete inventory: the path was enumerated, so tombstones
-   * stay precise, and the adapter is expected to suppress whatever it cannot
-   * prove (its project directory) rather than emit a partial tree. Reporting it
-   * here records the skip for the user without withholding the build.
+   * This records diagnostics without withholding unrelated publication. The
+   * adapter must also retainSession for affected indexed trees and withhold
+   * their projection/retraction; a diagnostic alone never protects old rows.
    */
   reportSkippedArtifact?(issue?: InventoryIssue): void;
 }

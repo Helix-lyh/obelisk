@@ -19,6 +19,20 @@ export interface ProviderSessionProvenance extends IndexedSession {
   readonly source: string;
 }
 
+export interface StoredProviderState {
+  readonly mtime: number;
+  readonly linesProcessed: number;
+  readonly cursor: Cursor;
+  readonly replayRequired: boolean;
+}
+
+export interface RetainedSession {
+  readonly source: string;
+  readonly sessionId: string;
+  readonly unitKey: string;
+  readonly checkpoint?: StoredProviderState;
+}
+
 export interface ProviderIndexItem {
   readonly provider: ProviderAdapter;
   readonly unit: IndexUnit;
@@ -33,6 +47,7 @@ export type ProviderReadMode = 'normal' | 'strict';
 
 export interface ProviderIndexPlan {
   readonly items: ProviderIndexItem[];
+  readonly retainedSessions: readonly RetainedSession[];
   readonly pendingMarkers: ReadonlyMap<string, string>;
   readonly replayKeys: ReadonlyMap<string, readonly string[]>;
   readonly incompleteProviders: ReadonlySet<string>;
@@ -145,11 +160,34 @@ export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT
   return hints;
 }
 
-export function storedProviderCursor(db: SqliteDb, key: string): Cursor {  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
-  if (!row) return null;
-  return typeof row.cursor === 'string'
-    ? row.cursor
-    : `${String(row.mtime)}:${String(row.lines_processed)}`;
+function storedState(row: Record<string, unknown>): StoredProviderState {
+  return {
+    mtime: Number(row.mtime),
+    linesProcessed: Number(row.lines_processed),
+    cursor: typeof row.cursor === 'string' ? row.cursor : null,
+    replayRequired: row.replay_required === 1,
+  };
+}
+
+export function readProviderIndexState(db: SqliteDb, schema: 'main' | 'previous_obelisk' = 'main'): ReadonlyMap<string, StoredProviderState> {
+  if (!db.prepare(`SELECT name FROM ${schema}.sqlite_master WHERE type='table' AND name='index_state'`).get()) return new Map();
+  return new Map(db.prepare(`SELECT * FROM ${schema}.index_state`).all()
+    .map(row => [String(row.jsonl_path), storedState(row)]));
+}
+
+function checkpointCursor(state: StoredProviderState | undefined): Cursor {
+  if (state === undefined) return null;
+  return state.cursor ?? `${state.mtime}:${state.linesProcessed}`;
+}
+
+function storedCheckpoint(db: SqliteDb, key: string): StoredProviderState | undefined {
+  const row = db.prepare('SELECT * FROM index_state WHERE jsonl_path = ?').get(key);
+  return row === undefined ? undefined : storedState(row);
+}
+
+export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
+  const state = storedCheckpoint(db, key);
+  return state?.replayRequired ? null : checkpointCursor(state);
 }
 
 export function providerSessionUnitKey(
@@ -193,15 +231,18 @@ export function createProviderIndexPlan(
     force = false,
     changedPaths,
     priorSessions,
+    priorIndexState,
     readMode = 'normal',
   }: {
     force?: boolean;
     changedPaths?: string[];
     priorSessions?: readonly ProviderSessionProvenance[];
+    priorIndexState?: ReadonlyMap<string, StoredProviderState>;
     readMode?: ProviderReadMode;
   } = {},
 ): ProviderIndexPlan {
   const items: ProviderIndexItem[] = [];
+  const retainedSessions: RetainedSession[] = [];
   const pendingMarkers = new Map<string, string>();
   const replayKeys = new Map<string, readonly string[]>();
   const incompleteProviders = new Set<string>();
@@ -224,7 +265,12 @@ export function createProviderIndexPlan(
     }
     let inventoryComplete = true;
     let reportedIssue: InventoryIssue | undefined;
+    const retainedIds = new Set<string>();
+    const previousState = (key: string) => priorIndexState?.get(key) ?? storedCheckpoint(db, key);
     const units = provider.discover({
+      snapshotRequired: fullReindex,
+      previousCursor: key => checkpointCursor(previousState(key)),
+      retainSession: id => retainedIds.add(id),
       lastCursor: fullReindex ? () => null : (key) => storedProviderCursor(db, key),
       changedPaths: fullReindex ? undefined : changedPaths,
       indexedSessions: () => indexedSessions,
@@ -237,6 +283,11 @@ export function createProviderIndexPlan(
         skippedArtifacts.push({ ...issue, provider: provider.name });
       },
     });
+    for (const session of indexedSessions) {
+      if (!retainedIds.has(session.sessionId)) continue;
+      const unitKey = providerSessionUnitKey(provider, session);
+      retainedSessions.push({ source: provider.name, sessionId: session.sessionId, unitKey, checkpoint: previousState(unitKey) });
+    }
     if (!inventoryComplete) {
       incompleteProviders.add(provider.name);
       inventoryIssues.push({
@@ -255,6 +306,9 @@ export function createProviderIndexPlan(
       pendingMarkers.set(provider.name, marker);
     }
     for (const unit of units) {
+      // A retain decision protects the complete canonical session, including
+      // against a provider accidentally emitting a replacement or tombstone.
+      if (retainedIds.has(unit.sessionId) || unit.retractSessionIds?.some(id => retainedIds.has(id))) continue;
       items.push({
         provider,
         unit: readMode === 'normal'
@@ -270,7 +324,7 @@ export function createProviderIndexPlan(
       });
     }
   }
-  return { items, pendingMarkers, replayKeys, incompleteProviders, inventoryIssues, skippedArtifacts };
+  return { items, retainedSessions, pendingMarkers, replayKeys, incompleteProviders, inventoryIssues, skippedArtifacts };
 }
 
 export function indexProviderPlan({
@@ -299,7 +353,7 @@ export function indexProviderPlan({
         // Commit the replay schedule with its first completed unit. After an
         // interruption, newly written cursors identify exactly what can resume.
         if (!replayScheduleCommitted) {
-          const clear = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
+          const scheduleReplay = db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path = ?');
           const keysToReplay = new Set(
             plan.items
               .filter(({ provider }) => plan.pendingMarkers.has(provider.name))
@@ -308,7 +362,7 @@ export function indexProviderPlan({
           for (const keys of plan.replayKeys.values()) {
             for (const key of keys) keysToReplay.add(key);
           }
-          for (const key of keysToReplay) clear.run(key);
+          for (const key of keysToReplay) scheduleReplay.run(key);
           writePendingMarkers(db, plan);
         }
         const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
@@ -379,7 +433,8 @@ export function writeProviderIndexMarkers(
   result: ProviderIndexResult,
 ): void {
   if (result.stopped !== undefined) return;
-  const retry = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
+  const retry = db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path = ?');
+  for (const session of plan.retainedSessions) retry.run(session.unitKey);
   const committed = new Set(result.committed.map(
     (item) => `${item.provider.name}\0${item.unit.key}`,
   ));
