@@ -524,7 +524,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // refuse every force publish, i.e. one newer-format file would block the whole
   // index (ADR-0014 version gate; CONTRIBUTING: skip and record, never poison the
   // provider). Explicit retained identities protect superseded twins while the
-  // complete identity census still permits unrelated proven deletions.
+  // current identity census lets fully reconciled healthy trees progress.
   const reportArtifactSkip = (issue: { path: string; error: string }) => {
     ctx.reportSkippedArtifact?.(issue);
   };
@@ -672,31 +672,38 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     members: group.paths.map(path => canonicalDeepseekTreeSessionId(rawIdByPath.get(path)!, group.scope)),
   }));
   const currentPathsBySessionId = new Map(candidates.map(candidate => [candidate.id, candidate.paths]));
+  const currentMemberIds = new Set(unsupportedVersion.length > 0
+    ? candidates.flatMap(candidate => candidate.members) : []);
   const uncertainProjects = new Set<string>();
   for (const indexed of ctx.indexedSessions?.() ?? []) {
     const previous = ctx.previousCursor?.(indexed.jsonlPath) ?? ctx.lastCursor(indexed.jsonlPath);
-    const state = decodeCursorState(previous);
+    const decoded = decodeCursorState(previous);
+    const state = decoded?.sessionId === indexed.sessionId ? decoded : null;
     const paths = [indexed.jsonlPath, ...Object.keys(state?.members ?? {})];
-    if (blockedProjects.size > 0 && (state === null || probePath(dirname(dirname(indexed.jsonlPath))) !== 'present')) {
-      // Missing membership, or an old root alias that no longer resolves:
-      // physical ownership cannot be reconstructed. A surviving root identity
-      // can locate the current project, but cannot certify which child moved.
+    const memberIds = [indexed.sessionId, ...Object.values(state?.members ?? {}).map(member => member.agentId ?? indexed.sessionId)];
+    if (blockedProjects.size > 0) {
       const currentPaths = currentPathsBySessionId.get(indexed.sessionId) ?? [];
-      if (currentPaths.length === 0 && probePath(dirname(dirname(dirname(indexed.jsonlPath)))) !== 'present') {
-        // No surviving identity or accessible historical source namespace can
-        // prove this old root absent; a future root may be its replacement.
+      if (memberIds.some(id => !currentMemberIds.has(id))) {
+        // Unknown envelopes can change id, scope and location. Neither today's
+        // realpath nor directory existence proves a missing historical member
+        // deleted: even the source namespace may have been replaced. Retain
+        // this tree until every member is accounted for or unknown content
+        // clears. Fully reconciled healthy trees still publish independently.
         blockedMembers.add(indexed.sessionId);
       }
-      const possibleProjects = [indexed.jsonlPath, ...currentPaths]
-        .map(path => canon(dirname(dirname(path))));
-      for (const project of possibleProjects) {
-        if (blockedProjects.has(project)) uncertainProjects.add(project);
+      if (state === null) {
+        // Without a trustworthy member census, protect possible projects too.
+        const possibleProjects = [indexed.jsonlPath, ...currentPaths]
+          .map(path => canon(dirname(dirname(path))));
+        for (const project of possibleProjects) {
+          if (blockedProjects.has(project)) uncertainProjects.add(project);
+        }
       }
     }
     candidates.push({
       id: indexed.sessionId,
       paths,
-      members: [indexed.sessionId, ...Object.values(state?.members ?? {}).map(member => member.agentId ?? indexed.sessionId)],
+      members: memberIds,
     });
   }
   // The same ownership closure drives suppression and watcher invalidation.

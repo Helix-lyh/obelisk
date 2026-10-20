@@ -93,8 +93,8 @@ never reaches projection. An unsupported member retains the complete root tree,
 not just its physical session directory. Discovery closes that decision over
 both the current graph and checkpointed members, so another tree cannot adopt a
 member and overwrite retained rows. If historical ownership is unavailable,
-project-local protection is conservative; unrelated proven deletions remain
-eligible when the identity census is otherwise complete. The same current and
+project-local protection is conservative. Unaccounted historical identities
+defer deletion until unknown content clears. The same current and
 historical ownership closure expands watcher invalidation on recovery, so an
 old owner cannot retract a member without its new owner being projected in the
 same completed refresh. Pending replay also bypasses the changed-path filter.
@@ -103,13 +103,24 @@ established project suppression.
 
 Retention matches current and checkpointed paths through the same physical-path
 canonicalization as watcher routing, including the longest existing ancestor for
-removed generations. Switching a configured source root between a symlink and
-its real directory must not detach historical ownership, even if an unsupported
-header changes scope. If an old alias was removed, a surviving root identity
-locates the current project for conservative protection. An indexed root with
-neither a surviving identity nor an accessible historical namespace is retained
-while future artifacts remain; its absence cannot be certified. Persisted unit
-keys remain unchanged.
+removed generations. Current realpath or directory existence alone is not proof
+of historical ownership: links can be rebound and members can move while the old
+project remains. A checkpoint is trusted only for its own indexed session id.
+While future artifacts exist, an indexed tree whose historical member identities
+are not fully accounted for in the current census retains its last-good closure.
+Unknown envelopes may change id, scope and location together, and a source path
+may be rebound or replaced by a regular directory. Without historical physical
+namespace evidence, no current-path comparison can distinguish such a move from
+a deletion. This correctness fallback covers root/child relocation and namespace
+reuse without adding another ownership heuristic. Intact readable trees continue
+publishing; a genuinely deleted historical root or member may remain stale until
+unknown content clears, including when that content later proves unrelated.
+Recovery then converges to the same result as a fresh full rebuild.
+
+If checkpoint membership is missing or belongs to another session, an absent
+root still retains its own history, while project-local protection uses the old
+and surviving current paths for roots still present. Persisted unit keys,
+checkpoint encoding and canonical identities remain unchanged.
 
 Historical paths/checkpoints identify candidate replaced roots, not deletion
 proof. Old identities may retire only when the complete current root census

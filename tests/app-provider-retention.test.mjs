@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -177,7 +177,7 @@ test('pending replay remains incomplete until a recovered seed is durable', () =
   assert.deepEqual(messagesAt(dbPath), before);
 });
 
-test('a future artifact does not prevent proven deletion of an unrelated indexed tree', () => {
+test('missing historical trees defer deletion until unknown content clears', () => {
   const { home, project, provider } = fixture();
   const dbPath = join(home, 'index.sqlite');
   const options = { dbPath, DatabaseImpl: TestDatabase, providerRegistry: createProviderRegistry([provider]) };
@@ -187,7 +187,7 @@ test('a future artifact does not prevent proven deletion of an unrelated indexed
   assert.equal(buildAppIndex(options).complete, true);
   const rows = messagesAt(dbPath);
   assert.ok(rows.some(row => row.agent_id !== null), 'the retained child stays visible');
-  assert.ok(!rows.some(row => row.uuid.includes('v3-basic')), 'the unrelated deleted tree is retracted');
+  assert.ok(rows.some(row => row.uuid.includes('v3-basic')), 'absence is not deletion proof while unknown content may own the old identity');
   rmSync(join(project, 'v3-seeded-parent'), { recursive: true });
   rmSync(join(project, 'v3-seeded-child'), { recursive: true });
   assert.equal(buildAppIndex(options).complete, true);
@@ -440,6 +440,162 @@ for (const direction of ['alias to real', 'real to alias']) {
   }
 }
 
+for (const relocation of ['rebound alias', 'relocated tree', 'relocated child']) {
+  for (const changedId of [false, true]) {
+    for (const mode of ['refresh', 'watch', 'force', 'replacement']) {
+      test(`historical ownership survives namespace reuse (${relocation}, ${changedId ? 'changed identity' : 'changed scope'}, ${mode})`, () => {
+        const { home, root, project } = fixture();
+        const movedProject = join(root, '--relocated--');
+        const alias = join(home, 'sessions-alias');
+        const isMove = relocation !== 'rebound alias';
+        if (isMove) {
+          mkdirSync(movedProject);
+          renameSync(join(project, 'v3-ptc'), join(movedProject, 'v3-ptc'));
+        } else {
+          symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+        const initialRoot = isMove ? root : alias;
+        const isolatedRoots = Object.fromEntries(createBuiltinProviderRegistry().catalog()
+          .map(provider => [provider.id, join(home, 'empty', provider.id)]));
+        const dbPath = join(home, 'index.sqlite');
+        const options = { dbPath, providerRoots: { ...isolatedRoots, deepseek: initialRoot } };
+        assert.equal(buildAppIndex(options).complete, true);
+        const before = messagesAt(dbPath);
+        const oldParentKey = join(initialRoot, '--dsh-v3--', 'v3-seeded-parent', 'session.v3.jsonl');
+        const initialDb = new DatabaseSync(dbPath);
+        const checkpoint = initialDb.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(oldParentKey).cursor;
+        initialDb.close();
+        if (isMove) {
+          const movedMembers = relocation === 'relocated tree'
+            ? ['v3-seeded-parent', 'v3-seeded-child'] : ['v3-seeded-child'];
+          for (const member of movedMembers) {
+            renameSync(join(project, member), join(movedProject, member));
+          }
+          rmSync(join(project, 'v3-basic'), { recursive: true });
+        } else {
+          rmSync(alias);
+          const other = join(home, 'other-sessions');
+          mkdirSync(join(other, '--dsh-v3--'), { recursive: true });
+          symlinkSync(other, alias, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+        const currentProject = isMove ? movedProject : project;
+        const future = publishFuture(currentProject, 'v3-seeded-child', {
+          cwd: '/future-scope', ...(changedId ? { id: 'future-child' } : {}),
+        });
+        const oldChild = join(currentProject, 'v3-seeded-child', 'session.v3.jsonl');
+        if (mode === 'replacement') rmSync(oldChild);
+        const healthy = appendHealthy(currentProject);
+        const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+        const nextOptions = { ...options, dbPath: target, providerRoots: { ...isolatedRoots, deepseek: root } };
+        const result = buildAppIndex({
+          ...nextOptions,
+          force: mode === 'force' || mode === 'replacement',
+          ...(mode === 'replacement' ? { preserveDbPath: dbPath } : {}),
+          ...(mode === 'watch' ? { changedPaths: [future, healthy] } : {}),
+        });
+        assert.equal(result.complete, true);
+        assert.equal(result.skipped, 1);
+        const after = messagesAt(target);
+        const expected = before;
+        assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), expected,
+          'a present historical directory cannot authorize a partial-tree replacement');
+        assert.equal(after.filter(row => row.text === 'healthy sibling progressed').length, 1,
+          'a healthy sibling in the current project must continue publishing');
+        const db = new DatabaseSync(target);
+        const retained = db.prepare('SELECT cursor, replay_required FROM index_state WHERE jsonl_path=?').get(oldParentKey);
+        assert.equal(retained.cursor, checkpoint);
+        assert.equal(retained.replay_required, 1);
+        db.close();
+        if (mode === 'replacement') {
+          assert.deepEqual(messagesAt(dbPath), before);
+          cpSync(join(FIXTURES, 'v3-seeded-child', 'session.v3.jsonl'), oldChild);
+        }
+        rmSync(future);
+        assert.equal(buildAppIndex(nextOptions).complete, true);
+        const recovered = isMove ? after.filter(row => !row.session_id.startsWith('deepseek:v3-basic:')) : after;
+        assert.deepEqual(messagesAt(target), recovered, 'recovery publishes the full tree and retires proven deletions');
+        const fresh = join(home, 'fresh.sqlite');
+        assert.equal(buildAppIndex({ ...nextOptions, dbPath: fresh, force: true }).complete, true);
+        assert.deepEqual(messagesAt(target), messagesAt(fresh));
+      });
+    }
+  }
+}
+
+for (const rootSpelling of ['alias', 'rebound real path', 'replaced directory']) {
+  for (const mode of ['refresh', 'watch', 'force', 'replacement']) {
+    test(`a rebound configured namespace is not historical deletion evidence (${rootSpelling}, ${mode})`, () => {
+      const { home, root, project } = fixture();
+      const alias = join(home, 'sessions-alias');
+      symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const isolatedRoots = Object.fromEntries(createBuiltinProviderRegistry().catalog()
+        .map(provider => [provider.id, join(home, 'empty', provider.id)]));
+      const dbPath = join(home, 'index.sqlite');
+      const options = { dbPath, providerRoots: { ...isolatedRoots, deepseek: alias } };
+      assert.equal(buildAppIndex(options).complete, true);
+      const before = messagesAt(dbPath);
+      const other = join(home, 'other-sessions');
+      const otherProject = join(other, '--dsh-v3--');
+      mkdirSync(otherProject, { recursive: true });
+      cpSync(join(project, 'v3-seeded-child'), join(otherProject, 'relocated-future'), { recursive: true });
+      cpSync(join(project, 'v3-ptc'), join(otherProject, 'v3-ptc'), { recursive: true });
+      publishFuture(otherProject, 'relocated-future', { id: 'future-child', cwd: '/future-scope' });
+      rmSync(alias);
+      if (rootSpelling === 'replaced directory') renameSync(other, alias);
+      else symlinkSync(other, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const currentProject = rootSpelling === 'replaced directory' ? join(alias, '--dsh-v3--') : otherProject;
+      const future = join(currentProject, 'relocated-future', 'session.v5.jsonl');
+      const healthy = appendHealthy(currentProject);
+      const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+      const nextOptions = {
+        ...options, dbPath: target,
+        providerRoots: { ...isolatedRoots, deepseek: rootSpelling === 'rebound real path' ? other : alias },
+      };
+      const result = buildAppIndex({
+        ...nextOptions, force: mode === 'force' || mode === 'replacement',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : {}),
+        ...(mode === 'watch' ? { changedPaths: [realpathSync(future), realpathSync(healthy)] } : {}),
+      });
+      assert.equal(result.complete, true);
+      assert.equal(result.skipped, 1);
+      const after = messagesAt(target);
+      assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), before,
+        'the original physical namespace was excluded, not proven absent');
+      assert.equal(after.filter(row => row.text === 'healthy sibling progressed').length, 1);
+      if (mode === 'replacement') assert.deepEqual(messagesAt(dbPath), before);
+      // Reinclude the original source: retained debt must replay its complete tree.
+      rmSync(future);
+      const recoveredOptions = { ...nextOptions, providerRoots: { ...isolatedRoots, deepseek: root } };
+      assert.equal(buildAppIndex(recoveredOptions).complete, true);
+      const fresh = join(home, 'fresh.sqlite');
+      assert.equal(buildAppIndex({ ...recoveredOptions, dbPath: fresh, force: true }).complete, true);
+      assert.deepEqual(messagesAt(target), messagesAt(fresh));
+    });
+  }
+}
+
+for (const force of [false, true]) {
+  test(`a future native-id collision does not freeze an intact scoped sibling (${force ? 'force' : 'watch'})`, () => {
+    const { home, root, project, provider } = fixture();
+    const dbPath = join(home, 'index.sqlite');
+    const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+    assert.equal(buildAppIndex(options).complete, true);
+    const before = messagesAt(dbPath);
+    const other = join(root, '--future-peer--');
+    mkdirSync(other);
+    cpSync(join(FIXTURES, 'v3-ptc'), join(other, 'v3-ptc'), { recursive: true });
+    const future = publishFuture(other, 'v3-ptc', { cwd: '/different-project' });
+    const healthy = appendHealthy(project);
+    const result = buildAppIndex({ ...options, force, changedPaths: [future, healthy] });
+    assert.equal(result.complete, true);
+    assert.equal(result.skipped, 1);
+    const after = messagesAt(dbPath);
+    assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), before);
+    assert.equal(after.filter(row => row.text === 'healthy sibling progressed').length, 1,
+      'a native id shared across scopes is not proof of a missing historical member');
+  });
+}
+
 test('a source alias still protects the project when historical membership is unavailable', () => {
   const { home, root, project } = fixture();
   const alias = join(home, 'sessions-alias');
@@ -460,6 +616,36 @@ test('a source alias still protects the project when historical membership is un
   assert.equal(result.complete, true);
   assert.equal(result.skipped, 1);
   assert.deepEqual(messagesAt(dbPath), before, 'unknown historical ownership uses the same physical project');
+});
+
+test('a reused unit key cannot certify another retained identity\'s historical membership', () => {
+  const { home, root, project, provider } = fixture();
+  const dbPath = join(home, 'index.sqlite');
+  const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+  assert.equal(buildAppIndex(options).complete, true);
+  const parent = join(project, 'v3-seeded-parent', 'session.v3.jsonl');
+  const [header, ...body] = readFileSync(parent, 'utf8').trimEnd().split('\n');
+  writeFileSync(parent, [JSON.stringify({ ...JSON.parse(header), id: 'replacement-parent' }), ...body].join('\n') + '\n');
+  const pending = join(root, '--pending--', 'pending');
+  mkdirSync(pending, { recursive: true });
+  writeFileSync(join(pending, 'session.v3.jsonl'), '');
+  assert.equal(buildAppIndex(options).complete, false);
+  const before = messagesAt(dbPath);
+  assert.ok(before.some(row => row.session_id.startsWith('deepseek:v3-seeded-parent:')));
+  assert.ok(before.some(row => row.session_id.startsWith('deepseek:replacement-parent:')),
+    'incomplete inventory deferred retirement while the reused key indexed the new root');
+  rmSync(join(root, '--pending--'), { recursive: true });
+  const future = publishFuture(project, 'v3-seeded-child', { id: 'future-child', cwd: '/future-scope' });
+  const retained = buildAppIndex({ ...options, force: true });
+  assert.equal(retained.complete, true);
+  assert.equal(retained.skipped, 1);
+  assert.deepEqual(messagesAt(dbPath), before,
+    'a checkpoint from the replacement root is not evidence about the old tree');
+  rmSync(future);
+  assert.equal(buildAppIndex(options).complete, true);
+  const fresh = join(home, 'fresh.sqlite');
+  assert.equal(buildAppIndex({ ...options, dbPath: fresh, force: true }).complete, true);
+  assert.deepEqual(messagesAt(dbPath), messagesAt(fresh));
 });
 
 for (const futureSession of ['v3-seeded-child', 'v3-seeded-parent', 'v3-ptc']) {
