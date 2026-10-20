@@ -119,19 +119,46 @@ publishing; a genuinely deleted historical root or member may remain stale until
 unknown content clears, including when that content later proves unrelated.
 Recovery then converges to the same result as a fresh full rebuild.
 
-If checkpoint membership is missing or belongs to another session, an absent
-root still retains its own history, while project-local protection uses the old
-and surviving current paths for roots still present. Persisted unit keys,
+If checkpoint membership is missing or belongs to another session, canonical
+subagent ownership supplies historical edges and the member census. Legacy
+callers without either source retain possible projects conservatively. An
+absent root still retains its own history. Persisted unit keys,
 checkpoint encoding and canonical identities remain unchanged.
 
 Historical paths/checkpoints identify candidate replaced roots, not deletion
 proof. Old identities may retire only when the complete current root census
 proves them absent everywhere; a live moved root is protected even if its old
-directory is reused. Retirement records are buffered inside parse after member
-and seed validation, never eager `IndexUnit.retractSessionIds` on a replacement.
+directory is reused. Retirement uses `IndexUnit.retractSessionIds` inside the
+publication transaction and requires strict snapshot validation, so no-op
+parse guards cannot certify an eager retraction. A standalone indexed root
+adopted as a subagent retires its old root row in that same transaction.
+Its moved-away checkpoint closes without repeating the retraction after the
+new owner writes child rows. If its old directory now belongs to a different
+root, that replacement owns the checkpoint key and must not retract the
+adopted identity. A changed checkpoint identity bypasses watcher routing hints
+and requires a complete snapshot.
 Force, canonical-marker replay, and pending replay of an indexed identity set
 `snapshotRequired`; an unavailable member, changed header, or undurable seed
 fails that projection instead of committing a cursor-only no-op after
 destructive cleanup or reporting unfinished recovery as complete. Ordinary
 incremental no-op guards retain their existing fail-closed behavior and cannot
-emit a buffered retirement.
+commit a retirement.
+
+**Amendment (2026-10-20): ownership transfers publish atomically.** Current
+trees, owned checkpoint members and canonical subagent ownership form connected
+components. A component with more than one root owner receives a shared
+`atomicGroup`; all its live owners and proven tombstones are planned together,
+including unchanged owners outside a watcher hint. Every live unit requires a
+complete snapshot. Shared indexing commits or rolls back that set as a whole,
+so the old owner cannot delete history before a failing new owner publishes it.
+A known divergent or unreadable receiver withholds the connected owners during
+discovery. A rootless transfer also withholds them; a rootless singleton may
+still represent a proven root deletion. Incomplete inventory protects historical
+members that cannot be accounted for, as does an unsupported artifact. Healthy
+components continue independently.
+
+Canonical ownership remains evidence even when its source checkpoint is lost or
+reused. It does not make every recorded spawn a required on-disk file: an owned
+checkpoint's actual file census remains authoritative when available. A
+successfully published deletion leaves a non-null tombstone cursor, clearing
+replay debt without recreating the retired session.

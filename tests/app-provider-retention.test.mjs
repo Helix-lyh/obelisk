@@ -380,6 +380,227 @@ test('watch recovery replays every current and historical owner before publishin
   assert.deepEqual(after, messagesAt(snapshotPath), 'watch recovery equals a complete source snapshot');
 });
 
+for (const destination of ['existing', 'new']) {
+  for (const order of ['a-destination', 'z-destination']) {
+    for (const failure of ['unfinished seed', 'divergent member', 'unreadable root']) {
+      for (const mode of ['refresh', 'watch', 'marker replay']) {
+        test(`ownership transfers publish atomically (${destination}, ${order}, ${failure}, ${mode})`, () => {
+          const { home, root, project, provider } = fixture();
+          const targetProject = join(root, '--destination--');
+          const healthyProject = join(root, '--healthy--');
+          mkdirSync(targetProject);
+          mkdirSync(healthyProject);
+          renameSync(join(project, 'v3-ptc'), join(healthyProject, 'v3-ptc'));
+          const destinationDir = join(targetProject, order);
+          if (destination === 'existing') renameSync(join(project, 'v3-basic'), destinationDir);
+          const dbPath = join(home, 'index.sqlite');
+          const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+          const initialOptions = mode === 'marker replay' ? {
+            ...options, providerRegistry: createProviderRegistry([{ ...provider, indexVersionMarker: '__deepseek_canonical_transcript_v4__' }]),
+          } : options;
+          assert.equal(buildAppIndex(initialOptions).complete, true);
+          const before = messagesAt(dbPath);
+          if (destination === 'new') cpSync(join(FIXTURES, 'v3-basic'), destinationDir, { recursive: true });
+          const destinationId = destination === 'new' ? 'new-destination' : 'v3-basic';
+          const rootPath = join(destinationDir, 'session.v3.jsonl.zstd');
+          // Use the real plain writer fixture for controlled header replacement.
+          if (destination === 'new') {
+            rmSync(rootPath);
+            cpSync(join(FIXTURES, 'v3-ptc', 'session.v3.jsonl'), join(destinationDir, 'session.v3.jsonl'));
+          }
+          const activeRoot = destination === 'new' ? join(destinationDir, 'session.v3.jsonl') : rootPath;
+          if (destination === 'new') {
+            const [header, ...body] = readFileSync(activeRoot, 'utf8').trimEnd().split('\n');
+            writeFileSync(activeRoot, [JSON.stringify({ ...JSON.parse(header), id: destinationId }), ...body].join('\n') + '\n');
+          }
+          const childDir = join(targetProject, 'v3-seeded-child');
+          renameSync(join(project, 'v3-seeded-child'), childDir);
+          const childPath = join(childDir, 'session.v3.jsonl');
+          const [header, ...body] = readFileSync(childPath, 'utf8').trimEnd().split('\n');
+          const durable = [JSON.stringify({ ...JSON.parse(header), parentSession: destinationId }), ...body].join('\n') + '\n';
+          writeFileSync(childPath, durable);
+          const rootBytes = readFileSync(activeRoot);
+          const duplicate = join(targetProject, 'copy-child');
+          if (failure === 'unfinished seed') writeFileSync(childPath, durable.split('\n')[0] + '\n');
+          if (failure === 'divergent member') {
+            cpSync(childDir, duplicate, { recursive: true });
+            appendFileSync(join(duplicate, 'session.v3.jsonl'), '\n');
+          }
+          if (failure === 'unreadable root') writeFileSync(activeRoot, 'not a session header\n');
+          const healthy = appendHealthy(healthyProject);
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const result = buildAppIndex({ ...options, ...(mode === 'watch' ? { changedPaths: [childPath, healthy] } : {}) });
+            assert.equal(result.complete, false, 'a withheld owner cannot certify the transfer complete');
+            assert.deepEqual(messagesAt(dbPath).filter(row => row.text !== 'healthy sibling progressed'), before,
+              'neither owner may publish part of a failed transfer');
+            assert.equal(messagesAt(dbPath).filter(row => row.text === 'healthy sibling progressed').length, 1);
+            assert.ok(result.affectedSessionIds.every(id => !id.includes('v3-seeded-parent') && !id.includes(destinationId)),
+              'rolled-back or withheld owners emit no success notification');
+          }
+          writeFileSync(childPath, durable);
+          writeFileSync(activeRoot, rootBytes);
+          if (failure === 'divergent member') rmSync(duplicate, { recursive: true });
+          const recovered = buildAppIndex({ ...options, changedPaths: [childPath, activeRoot] });
+          assert.equal(recovered.complete, true);
+          const childRows = messagesAt(dbPath).filter(row => row.agent_id !== null);
+          assert.equal(childRows.length, before.filter(row => row.agent_id !== null).length);
+          assert.ok(childRows.every(row => row.session_id.includes(destinationId)));
+          const fresh = join(home, 'fresh.sqlite');
+          assert.equal(buildAppIndex({ ...options, dbPath: fresh, force: true }).complete, true);
+          assert.deepEqual(messagesAt(dbPath), messagesAt(fresh));
+        });
+      }
+    }
+  }
+}
+
+function canonicalAt(path) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return Object.fromEntries(['sessions', 'messages', 'tool_calls', 'tool_results', 'summaries', 'subagents', 'workflows', 'workflow_agents']
+      .map(table => [table, db.prepare(`SELECT * FROM ${table}`).all().map(row => JSON.stringify(row)).sort()]));
+  } finally { db.close(); }
+}
+
+for (const command of ['query', 'search']) {
+  test(`built CLI ${command} recovery rolls back a failed ownership set`, () => {
+    const { home, project } = fixture();
+    const initial = runCli(['--build'], { home });
+    assert.equal(initial.status, 0, initial.stderr || initial.stdout);
+    const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+    const before = messagesAt(dbPath);
+    const future = publishFuture(project, 'v3-seeded-parent');
+    assert.equal(runCli(['--build'], { home }).status, 0);
+    const child = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+    const [header, ...body] = readFileSync(child, 'utf8').trimEnd().split('\n');
+    const durable = [JSON.stringify({ ...JSON.parse(header), parentSession: 'v3-basic' }), ...body].join('\n') + '\n';
+    writeFileSync(child, durable.split('\n')[0] + '\n');
+    rmSync(future);
+    appendHealthy(project);
+    const query = join(home, 'query.mjs');
+    writeFileSync(query, "return search('healthy sibling progressed');");
+    const refresh = () => {
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE index_state SET mtime=0 WHERE jsonl_path='__last_build__'").run();
+      db.close();
+      return runCli(command === 'query' ? ['--query', query] : ['--search', 'healthy sibling progressed'], { home });
+    };
+    const failed = refresh();
+    assert.equal(failed.status, 0, failed.stderr || failed.stdout);
+    assert.match(failed.stderr, /Seed marker is not durable/);
+    assert.equal(JSON.parse(failed.stdout).length, 1);
+    assert.deepEqual(messagesAt(dbPath).filter(row => row.text !== 'healthy sibling progressed'), before);
+    writeFileSync(child, durable);
+    assert.equal(refresh().status, 0);
+    const recovered = canonicalAt(dbPath);
+    const fresh = runCli(['--build'], { home });
+    assert.equal(fresh.status, 0, fresh.stderr || fresh.stdout);
+    assert.deepEqual(canonicalAt(dbPath), recovered);
+    const after = new DatabaseSync(dbPath);
+    assert.equal(after.prepare('SELECT count(*) n FROM index_state WHERE replay_required=1').get().n, 0);
+    after.close();
+  });
+}
+
+for (const evidence of ['missing checkpoint', 'foreign checkpoint', 'deleted old root']) {
+  for (const mode of ['watch', 'force', 'replacement']) {
+    test(`ownership recovery preserves canonical history (${evidence}, ${mode})`, () => {
+      const { home, project, provider } = fixture();
+      const dbPath = join(home, 'index.sqlite');
+      const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+      assert.equal(buildAppIndex(options).complete, true);
+      const before = canonicalAt(dbPath);
+      const oldRoot = join(project, 'v3-seeded-parent', 'session.v3.jsonl');
+      const childPath = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+      const [header, ...body] = readFileSync(childPath, 'utf8').trimEnd().split('\n');
+      const durable = [JSON.stringify({ ...JSON.parse(header), parentSession: 'v3-basic' }), ...body].join('\n') + '\n';
+      const db = new DatabaseSync(dbPath);
+      if (evidence === 'missing checkpoint') db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(oldRoot);
+      if (evidence === 'foreign checkpoint') {
+        const foreign = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?')
+          .get(join(project, 'v3-basic', 'session.v3.jsonl.zstd')).cursor;
+        db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(foreign, oldRoot);
+      }
+      db.close();
+      if (evidence === 'deleted old root') rmSync(join(project, 'v3-seeded-parent'), { recursive: true });
+      writeFileSync(childPath, durable.split('\n')[0] + '\n');
+      const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+      const next = { ...options, dbPath: target };
+      const failed = buildAppIndex({ ...next, force: mode !== 'watch',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : { changedPaths: [childPath] }) });
+      assert.equal(failed.complete, false);
+      // Replacement publication never swaps a failed target into place.
+      assert.deepEqual(canonicalAt(dbPath), before);
+      writeFileSync(childPath, durable);
+      const recovered = buildAppIndex({ ...next, force: mode !== 'watch',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : { changedPaths: [childPath] }) });
+      assert.equal(recovered.complete, true);
+      const fresh = join(home, 'fresh.sqlite');
+      assert.equal(buildAppIndex({ ...options, dbPath: fresh, force: true }).complete, true);
+      assert.deepEqual(canonicalAt(target), canonicalAt(fresh), 'all canonical tables converge after transfer');
+      const after = new DatabaseSync(target);
+      assert.equal(after.prepare('SELECT count(*) n FROM index_state WHERE replay_required=1').get().n, 0);
+      after.close();
+    });
+  }
+}
+
+for (const layout of ['same directory', 'moved directory', 'reused directory']) {
+  for (const mode of ['watch', 'force', 'replacement']) {
+    test(`adopting an indexed root retires its standalone identity only after success (${layout}, ${mode})`, () => {
+      const { home, project, provider } = fixture();
+      const dbPath = join(home, 'index.sqlite');
+      const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+      assert.equal(buildAppIndex(options).complete, true);
+      const before = canonicalAt(dbPath);
+      const oldDir = join(project, 'v3-ptc');
+      const adoptedDir = layout === 'same directory' ? oldDir : join(project, 'moved-ptc');
+      if (adoptedDir !== oldDir) renameSync(oldDir, adoptedDir);
+      if (layout === 'reused directory') {
+        cpSync(join(FIXTURES, 'v3-ptc'), oldDir, { recursive: true });
+        const replacement = join(oldDir, 'session.v3.jsonl');
+        const [first, ...rest] = readFileSync(replacement, 'utf8').trimEnd().split('\n');
+        writeFileSync(replacement, [JSON.stringify({ ...JSON.parse(first), id: 'replacement-root' }), ...rest].join('\n') + '\n');
+      }
+      const adopted = join(adoptedDir, 'session.v3.jsonl');
+      const originalRoot = readFileSync(adopted, 'utf8');
+      const [header, ...body] = readFileSync(adopted, 'utf8').trimEnd().split('\n');
+      writeFileSync(adopted, [JSON.stringify({ ...JSON.parse(header), parentSession: 'v3-seeded-parent' }), ...body].join('\n') + '\n');
+      const seed = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+      const durable = readFileSync(seed, 'utf8');
+      writeFileSync(seed, durable.split('\n')[0] + '\n');
+      const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+      const build = () => buildAppIndex({ ...options, dbPath: target, force: mode !== 'watch',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : { changedPaths: [adopted] }) });
+      assert.equal(build().complete, false);
+      const withoutReplacement = snapshot => Object.fromEntries(Object.entries(snapshot)
+        .map(([table, rows]) => [table, rows.filter(row => !row.includes('deepseek:replacement-root:'))]));
+      assert.deepEqual(withoutReplacement(canonicalAt(dbPath)), before);
+      writeFileSync(seed, durable);
+      const recovered = build();
+      assert.equal(recovered.complete, true);
+      assert.ok(recovered.affectedSessionIds.some(id => id.startsWith('deepseek:v3-ptc:')), 'retired roots notify consumers');
+      const fresh = join(home, 'fresh.sqlite');
+      assert.equal(buildAppIndex({ ...options, dbPath: fresh, force: true }).complete, true);
+      assert.deepEqual(canonicalAt(target), canonicalAt(fresh), 'no standalone ghost or duplicate aggregate remains');
+      const after = new DatabaseSync(target);
+      assert.equal(after.prepare('SELECT count(*) n FROM index_state WHERE replay_required=1').get().n, 0);
+      if (layout === 'reused directory') {
+        const cursor = after.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(join(oldDir, 'session.v3.jsonl')).cursor;
+        assert.ok(JSON.parse(Buffer.from(cursor.split(':')[2], 'base64url').toString()).sessionId.startsWith('deepseek:replacement-root:'));
+      }
+      after.close();
+      // A former root may become independent again. Its old pre-adoption cursor
+      // must not certify rows that were retired while it belonged to the parent.
+      writeFileSync(adopted, originalRoot);
+      assert.equal(buildAppIndex({ ...options, dbPath: target, changedPaths: [adopted] }).complete, true);
+      const independent = join(home, 'independent.sqlite');
+      assert.equal(buildAppIndex({ ...options, dbPath: independent, force: true }).complete, true);
+      assert.deepEqual(canonicalAt(target), canonicalAt(independent), 'adoption followed by independence replays complete history');
+    });
+  }
+}
+
 // Controlled replacement boundary, as in cross-tree recovery above: released
 // DSH headers are immutable; this models replacement of ancestry plus a future
 // envelope changing scope, not a normal append by the current writer.

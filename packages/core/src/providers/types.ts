@@ -42,12 +42,17 @@ export interface IndexUnit {
   meta?: unknown;
   /** Previously indexed sessions atomically retracted by persist before this unit is written. */
   retractSessionIds?: readonly string[];
+  /** Provider-scoped publication set. Every planned unit with this key commits
+   * together; the adapter must withhold the set if discovery cannot supply it. */
+  atomicGroup?: string;
 }
 
 /** Read-only source provenance exposed to one provider during discovery. */
 export interface IndexedSession {
   sessionId: string;
   jsonlPath: string;
+  /** Canonical subagent identities previously owned by this session. */
+  memberSessionIds?: readonly string[];
 }
 
 /** One source location that prevented a provider from certifying its inventory. */

@@ -240,3 +240,22 @@ so healthy units converge independently while retained units remain pending.
 The DeepSeek v5 canonical marker schedules one repair replay of readable trees
 that older discovery could have published without a child. No transcript UUID,
 record shape, or adapter cursor encoding changes.
+
+**Amendment (2026-10-20): connected publication transactions.** A provider may
+set `IndexUnit.atomicGroup` to connect multiple units whose ownership changes
+must publish together. The key is opaque and provider-scoped. Shared indexing
+commits each group, including retractions, canonical writes, project-path
+updates and cursors, in one retryable transaction. A failed group rolls back
+every member and schedules replay for the whole group; unrelated units may
+still progress. Successful notifications run only after the group commits.
+Retaining one planned member also retains the group's replacement identities.
+
+Discovery must include every participating owner, even an unchanged owner, and
+withhold the complete group when any owner is known unavailable. An unstable
+parse in such a group must throw rather than return a successful no-op.
+Canonical subagent ownership is exposed as optional `IndexedSession.memberSessionIds`
+alongside source provenance, so providers can recover historical ownership when
+a checkpoint is missing or belongs to a different identity. Shared code neither
+decodes provider cursors nor interprets ancestry. Providers without groups keep
+their existing per-unit publication behavior; force remains a single snapshot
+transaction across all units.

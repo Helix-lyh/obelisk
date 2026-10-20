@@ -485,8 +485,6 @@ interface TreeUnitMeta {
   rootRawId: string;
   /** Members in stable order: root first, then subagents by path. */
   members: TreeMember[];
-  /** Absent historical identities, retired only after validating this snapshot. */
-  retiredSessionIds?: readonly string[];
   snapshotRequired?: boolean;
 }
 
@@ -507,6 +505,56 @@ function resolveRootRawId(rawId: string, header: DshHeader, headersByScopedId: M
     current = headersByScopedId.get(`${scope}\0${root}`);
   }
   return root;
+}
+
+// Current and canonical/checkpointed ownership form publication sets. Keep
+// this provider-local: the shared writer receives only opaque group keys.
+function connectTreeOwnership(candidates: readonly { id: string; members: readonly string[] }[]) {
+  const parents = new Map<string, string>();
+  const find = (id: string): string => {
+    let root = parents.get(id) ?? id;
+    while (parents.has(root) && parents.get(root) !== root) root = parents.get(root)!;
+    let current = id;
+    while (current !== root) {
+      const next = parents.get(current) ?? root;
+      parents.set(current, root);
+      current = next;
+    }
+    parents.set(root, root);
+    return root;
+  };
+  for (const candidate of candidates) {
+    for (const member of candidate.members) {
+      const owner = find(candidate.id), child = find(member);
+      if (owner !== child) parents.set(child, owner);
+    }
+  }
+  const components = new Map<string, Set<string>>();
+  for (const id of parents.keys()) {
+    const root = find(id), ids = components.get(root) ?? new Set<string>();
+    ids.add(id);
+    components.set(root, ids);
+  }
+  const owners = new Map<string, Set<string>>();
+  for (const candidate of candidates) {
+    const root = find(candidate.id), ids = owners.get(root) ?? new Set<string>();
+    ids.add(candidate.id);
+    owners.set(root, ids);
+  }
+  const atomicGroupById = new Map<string, string>();
+  for (const [root, ids] of owners) {
+    if (ids.size < 2) continue;
+    const key = [...ids].sort()[0]!;
+    for (const id of components.get(root) ?? []) atomicGroupById.set(id, key);
+  }
+  const relatedTrees = (seeds: ReadonlySet<string>): Set<string> => {
+    const related = new Set<string>();
+    for (const id of seeds) {
+      for (const member of components.get(find(id)) ?? [id]) related.add(member);
+    }
+    return related;
+  };
+  return { relatedTrees, atomicGroupById };
 }
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
@@ -662,7 +710,13 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // Close suppression over BOTH current and historical tree membership. A
   // member moved to a new root must not overwrite rows retained by its old root.
   const blockedDirs = new Set(unsupportedVersion.map(file => canon(dirname(file.path))));
-  const blockedProjects = new Set(unsupportedVersion.map(file => canon(dirname(dirname(file.path)))));
+  const blockedProjects = new Set([...unsupportedVersion, ...unreadable]
+    .map(file => canon(dirname(dirname(file.path)))));
+  const unavailableTrees = new Set([...membersByRootKey.entries()]
+    .filter(([key, group]) => divergentGroups.has(key)
+      || group.paths.some(path => suppressedProjectDirs.has(fileByPath.get(path)?.projectDir ?? '')))
+    .map(([, group]) => canonicalDeepseekTreeSessionId(group.rootRawId, group.scope)));
+  const ownershipUncertain = unsupportedVersion.length > 0 || tombstonesUnsafe;
   const blockedMembers = new Set(unsupportedVersion.map(file =>
     canonicalDeepseekTreeSessionId(rawIdByPath.get(file.path)!, projectScope(headerByPath.get(file.path)!.cwd))));
   const retainedSessionIds = new Set<string>();
@@ -674,8 +728,10 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const currentPathsBySessionId = new Map(candidates.map(candidate => [candidate.id, candidate.paths]));
   // Rootless groups still link ownership below, but cannot account for a
   // historical member: they never emit a replacement unit.
-  const currentMemberIds = new Set(unsupportedVersion.length > 0
-    ? candidates.filter(candidate => candidate.members.includes(candidate.id))
+  const rootlessTrees = candidates.filter(candidate => !candidate.members.includes(candidate.id));
+  const currentMemberIds = new Set(ownershipUncertain
+    ? candidates.filter(candidate => candidate.members.includes(candidate.id)
+      && !unavailableTrees.has(candidate.id) && !candidate.paths.some(path => unsupportedPaths.has(path)))
       .flatMap(candidate => candidate.members) : []);
   const uncertainProjects = new Set<string>();
   for (const indexed of ctx.indexedSessions?.() ?? []) {
@@ -683,19 +739,21 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     const decoded = decodeCursorState(previous);
     const state = decoded?.sessionId === indexed.sessionId ? decoded : null;
     const paths = [indexed.jsonlPath, ...Object.keys(state?.members ?? {})];
-    const memberIds = [indexed.sessionId, ...Object.values(state?.members ?? {}).map(member => member.agentId ?? indexed.sessionId)];
-    if (blockedProjects.size > 0) {
+    const checkpointMembers = [indexed.sessionId, ...Object.values(state?.members ?? {}).map(member => member.agentId ?? indexed.sessionId)];
+    const memberIds = [...new Set([...checkpointMembers, ...indexed.memberSessionIds ?? []])];
+    if (ownershipUncertain) {
       const currentPaths = currentPathsBySessionId.get(indexed.sessionId) ?? [];
-      if (memberIds.some(id => !currentMemberIds.has(id))) {
-        // Unknown envelopes can change id, scope and location. Neither today's
+      const requiredMembers = state === null ? memberIds : checkpointMembers;
+      if (requiredMembers.some(id => !currentMemberIds.has(id))) {
+        // Uncertain inventory can hide a change in id, scope or location. Neither today's
         // realpath nor directory existence proves a missing historical member
         // deleted: even the source namespace may have been replaced. Retain
         // this tree until every member is accounted for or unknown content
         // clears. Fully reconciled healthy trees still publish independently.
         blockedMembers.add(indexed.sessionId);
       }
-      if (state === null) {
-        // Without a trustworthy member census, protect possible projects too.
+      if (state === null && indexed.memberSessionIds === undefined) {
+        // Legacy callers without either membership source protect projects too.
         const possibleProjects = [indexed.jsonlPath, ...currentPaths]
           .map(path => canon(dirname(dirname(path))));
         for (const project of possibleProjects) {
@@ -709,23 +767,16 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       members: memberIds,
     });
   }
-  // The same ownership closure drives suppression and watcher invalidation.
-  // On recovery, every old/new owner must replay before the build is complete.
-  const relatedTrees = (seeds: ReadonlySet<string>): Set<string> => {
-    const selected = new Set(seeds);
-    let expanded = true;
-    while (expanded) {
-      expanded = false;
-      for (const candidate of candidates) {
-        if (!selected.has(candidate.id) && !candidate.members.some(id => selected.has(id))) continue;
-        for (const id of [candidate.id, ...candidate.members]) {
-          if (!selected.has(id)) { selected.add(id); expanded = true; }
-        }
-      }
-    }
-    return selected;
-  };
-  for (const candidate of unsupportedVersion.length > 0 ? candidates : []) {
+  const { relatedTrees, atomicGroupById } = connectTreeOwnership(candidates);
+  // A known unavailable receiver withholds every connected owner. A rootless
+  // singleton may still be a proven deletion; a rootless transfer cannot be.
+  for (const id of unavailableTrees) blockedMembers.add(id);
+  for (const candidate of rootlessTrees) {
+    if (!atomicGroupById.has(candidate.id)) continue;
+    if (!ownershipUncertain) reportIssue({ path: candidate.paths[0]!, error: 'Session tree root is unavailable for ownership transfer' });
+    blockedMembers.add(candidate.id);
+  }
+  for (const candidate of ownershipUncertain ? candidates : []) {
     if (candidate.paths.some(path => blockedDirs.has(canon(dirname(path)))
       || (uncertainProjects.size > 0 && uncertainProjects.has(canon(dirname(dirname(path))))))) {
       blockedMembers.add(candidate.id);
@@ -834,6 +885,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       .filter((group) => group.paths.some((path) => rawIdByPath.get(path) === group.rootRawId))
       .map((group) => canonicalDeepseekTreeSessionId(group.rootRawId, group.scope)),
   );
+  const currentMemberSessionIds = new Set([...membersByRootKey.values()]
+    .flatMap(group => group.paths.map(path => canonicalDeepseekTreeSessionId(rawIdByPath.get(path)!, group.scope))));
 
   const units: IndexUnit[] = [];
   for (const [groupIndex, [groupKey, group]] of [...membersByRootKey.entries()].entries()) {
@@ -868,28 +921,41 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       .filter(indexed => dirname(indexed.jsonlPath) === dirname(rootPath) && indexed.sessionId !== sessionId)
       .map(indexed => indexed.sessionId));
     const previousState = decodeCursorState(ctx.previousCursor?.(rootPath) ?? ctx.lastCursor(rootPath));
-    if (previousState !== null && previousState.sessionId !== sessionId) replacedIds.add(previousState.sessionId);
-    const retiredSessionIds = [...replacedIds].filter(id => inventoryComplete && !liveSessionIds.has(id) && !retainedSessionIds.has(id));
+    const identityChanged = previousState !== null && previousState.sessionId !== sessionId;
+    if (identityChanged) replacedIds.add(previousState.sessionId);
+    for (const member of members) {
+      if (member.isSubagent && (ctx.indexedSessions?.() ?? []).some(indexed => indexed.sessionId === member.dbId)) {
+        replacedIds.add(member.dbId);
+      }
+    }
+    // An adopted root belongs to its new owner. Reusing its old directory must
+    // not let an unrelated replacement delete the newly owned child rows.
+    const retiredSessionIds = [...replacedIds].filter(id => inventoryComplete && !liveSessionIds.has(id)
+      && !retainedSessionIds.has(id) && (!currentMemberSessionIds.has(id)
+        || members.some(member => member.isSubagent && member.dbId === id)));
     // A pending replay still owes a complete snapshot after the global marker
     // has advanced. Historical checkpoints and moved indexed identities must
     // not be certified by the ordinary incremental "writer still active" no-op.
-    const snapshotRequired = ctx.snapshotRequired || (cursor === null && (
+    const atomicGroup = atomicGroupById.get(sessionId);
+    const snapshotRequired = identityChanged || retiredSessionIds.length > 0 || atomicGroup !== undefined || ctx.snapshotRequired || (cursor === null && (
       previousState !== null || replacedIds.size > 0
       || (ctx.indexedSessions?.() ?? []).some(indexed => indexed.sessionId === sessionId)
     ));
     // Even an unchanged current tree may still owe a deferred old-identity
     // retirement after an earlier incomplete inventory.
-    if (retiredSessionIds.length === 0 && changedFiles === null && cursor !== null) {
+    if (!identityChanged && atomicGroup === undefined && retiredSessionIds.length === 0 && changedFiles === null && cursor !== null) {
       const state = decodeCursorState(cursor);
       if (state !== null && treeMatchesState(members, state)) continue;
     }
-    if (retiredSessionIds.length === 0 && cursor !== null && routing !== null && routing !== 'all' && !routing.has(groupIndex)) continue;
+    if (!identityChanged && atomicGroup === undefined && retiredSessionIds.length === 0 && cursor !== null && routing !== null && routing !== 'all' && !routing.has(groupIndex)) continue;
     units.push({
       key: rootPath,
       sessionId,
+      ...(atomicGroup === undefined ? {} : { atomicGroup }),
+      ...(retiredSessionIds.length === 0 ? {} : { retractSessionIds: retiredSessionIds }),
       project: projectSlugFromPath(typeof rootHeader.cwd === 'string' ? rootHeader.cwd : null) ?? undefined,
       meta: { kind: 'session-tree', scope: group.scope, rootRawId: group.rootRawId, members,
-        retiredSessionIds, snapshotRequired } satisfies TreeUnitMeta,
+        snapshotRequired } satisfies TreeUnitMeta,
     });
   }
 
@@ -902,16 +968,23 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // Identity liveness is computed from ALL groups with a root member —
   // BEFORE the changed-path filter. A cross-directory move reported by the
   // watcher as only the OLD path must not tombstone the moved session.
+  const currentRootPaths = new Set([...membersByRootKey.values()].flatMap(group => group.paths
+    .filter(path => rawIdByPath.get(path) === group.rootRawId).map(canon)));
+  const currentPaths = new Set(files.map(file => canon(file.path)));
   for (const indexed of inventoryComplete ? (ctx.indexedSessions?.() ?? []) : []) {
     if (retainedSessionIds.has(indexed.sessionId)) continue;
     if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
     const jsonlPath = indexed.jsonlPath;
-    if (fileByPath.has(jsonlPath)) continue; // still a member of a discovered tree
-    if (probePath(jsonlPath) !== 'gone') continue; // present — or unreachable: keep last-good
+    if (currentRootPaths.has(canon(jsonlPath))) continue; // another live root owns this checkpoint key
+    if (!currentPaths.has(canon(jsonlPath)) && probePath(jsonlPath) !== 'gone') continue;
     units.push({
       key: jsonlPath,
       sessionId: indexed.sessionId,
-      retractSessionIds: [indexed.sessionId],
+      ...(atomicGroupById.has(indexed.sessionId) ? { atomicGroup: atomicGroupById.get(indexed.sessionId)! } : {}),
+      // A moved, adopted root is already retired by its strict new owner.
+      // Only close its old checkpoint here; deleting again would erase the
+      // child rows just written by that owner in this publication set.
+      retractSessionIds: currentMemberSessionIds.has(indexed.sessionId) ? [] : [indexed.sessionId],
       meta: { kind: 'session-tree', scope: '', rootRawId: '', members: [] },
     });
   }
@@ -1176,7 +1249,7 @@ const timestampOfMs = (time: number | null): string | null => (
 
 function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as TreeUnitMeta;
-  if (meta.members.length === 0) return null; // tombstone: persist retracts via retractSessionIds
+  if (meta.members.length === 0) return '0:0:deepseek-tombstone-v1'; // persist retracts via retractSessionIds
 
   const sessionId = unit.sessionId;
   const prior = decodeCursorState(cursor);
@@ -1205,16 +1278,15 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   const priorPaths = prior === null ? [] : Object.keys(prior.members).sort();
   const memberPaths = meta.members.map((member) => member.path).sort();
   const sameMemberSet = priorPaths.length === memberPaths.length && priorPaths.every((path, i) => path === memberPaths[i]);
-  const fast = prior !== null && sameMemberSet && meta.members.every((member) => {
+  const fast = !meta.snapshotRequired && prior !== null && sameMemberSet && meta.members.every((member) => {
     const snap = snaps.get(member.path);
     const cp = prior.members[member.path];
     return snap !== undefined && cp !== undefined && memberMatchesCheckpoint(member, snap, cp);
   });
 
-  // No persist-level eager retraction: all identity retirements stay in this
-  // buffered stream until every member and seed marker has been validated.
-  const recordsOut: TranscriptRecord[] = (meta.retiredSessionIds ?? [])
-    .map(id => ({ kind: 'delete-session', sessionId: id }));
+  // Retirements use the unit contract inside the publication transaction.
+  // snapshotRequired turns every pre-projection no-op into a rollback.
+  const recordsOut: TranscriptRecord[] = [];
   if (!fast) {
     // Snapshot fallback always retracts before re-emitting — including the
     // prior-less case, which covers a MOVED tree (the new path has no cursor,

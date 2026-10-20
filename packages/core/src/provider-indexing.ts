@@ -211,16 +211,27 @@ export function storedSessionCursor(
   return storedProviderCursor(db, unitKey);
 }
 
-export function readProviderSessionProvenance(db: SqliteDb): ProviderSessionProvenance[] {
+export function readProviderSessionProvenance(db: SqliteDb, schema: 'main' | 'previous_obelisk' = 'main'): ProviderSessionProvenance[] {
+  const members = new Map<string, string[]>();
+  if (db.prepare(`SELECT name FROM ${schema}.sqlite_master WHERE type='table' AND name='subagents'`).get()) {
+    for (const row of db.prepare(`SELECT session_id, agent_id FROM ${schema}.subagents`).all()) {
+      if (typeof row.session_id !== 'string' || typeof row.agent_id !== 'string') continue;
+      const ids = members.get(row.session_id) ?? [];
+      ids.push(row.agent_id);
+      members.set(row.session_id, ids);
+    }
+  }
+  const hasSource = db.prepare(`PRAGMA ${schema}.table_info(sessions)`).all().some(column => column.name === 'source');
   return db.prepare(`
-    SELECT id, jsonl_path, COALESCE(source, 'claude') AS source
-    FROM sessions
+    SELECT id, jsonl_path, ${hasSource ? "COALESCE(source, 'claude')" : "'claude'"} AS source
+    FROM ${schema}.sessions
     WHERE jsonl_path IS NOT NULL
       AND jsonl_path != ''
   `).all().map((row) => ({
     source: String(row.source),
     sessionId: String(row.id),
     jsonlPath: String(row.jsonl_path),
+    memberSessionIds: members.get(String(row.id)) ?? [],
   }));
 }
 
@@ -252,7 +263,7 @@ export function createProviderIndexPlan(
   for (const provider of registry.list()) {
     const indexedSessions = provenance
       .filter((session) => session.source === provider.name)
-      .map(({ sessionId, jsonlPath }) => ({ sessionId, jsonlPath }));
+      .map(({ sessionId, jsonlPath, memberSessionIds }) => ({ sessionId, jsonlPath, memberSessionIds }));
     const marker = provider.indexVersionMarker;
     const markerMissing = marker !== undefined && !db.prepare(
       'SELECT jsonl_path FROM index_state WHERE jsonl_path = ?',
@@ -283,6 +294,14 @@ export function createProviderIndexPlan(
         skippedArtifacts.push({ ...issue, provider: provider.name });
       },
     });
+    const retainedGroups = new Set(units.filter(unit => unit.atomicGroup !== undefined
+      && (retainedIds.has(unit.sessionId) || unit.retractSessionIds?.some(id => retainedIds.has(id))))
+      .map(unit => unit.atomicGroup!));
+    for (const unit of units) {
+      if (unit.atomicGroup === undefined || !retainedGroups.has(unit.atomicGroup)) continue;
+      retainedIds.add(unit.sessionId);
+      for (const id of unit.retractSessionIds ?? []) retainedIds.add(id);
+    }
     for (const session of indexedSessions) {
       if (!retainedIds.has(session.sessionId)) continue;
       const unitKey = providerSessionUnitKey(provider, session);
@@ -347,11 +366,22 @@ export function indexProviderPlan({
   const failedProviders = new Set<string>();
   const failedItems: ProviderIndexItem[] = [];
   let replayScheduleCommitted = plan.pendingMarkers.size === 0 && plan.replayKeys.size === 0;
+  const batches: ProviderIndexItem[][] = [];
+  const grouped = new Map<string, ProviderIndexItem[]>();
   for (const item of plan.items) {
+    if (item.unit.atomicGroup === undefined) { batches.push([item]); continue; }
+    const key = `${item.provider.name}\0${item.unit.atomicGroup}`;
+    let batch = grouped.get(key);
+    if (batch === undefined) { batch = []; grouped.set(key, batch); batches.push(batch); }
+    batch.push(item);
+  }
+  for (const batch of batches) {
+    let active = batch[0]!;
+    let cursors: Cursor[];
     try {
-      const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
-        // Commit the replay schedule with its first completed unit. After an
-        // interruption, newly written cursors identify exactly what can resume.
+      cursors = runTransaction(`provider:${active.provider.name}:${active.unit.atomicGroup ?? active.unit.key}`, () => {
+        // Replay scheduling and every unit in this publication set roll back
+        // together. A BUSY retry runs the entire set again.
         if (!replayScheduleCommitted) {
           const scheduleReplay = db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path = ?');
           const keysToReplay = new Set(
@@ -365,25 +395,27 @@ export function indexProviderPlan({
           for (const key of keysToReplay) scheduleReplay.run(key);
           writePendingMarkers(db, plan);
         }
-        const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
-        onPersisted(item, nextCursor);
-        return nextCursor;
+        return batch.map(item => {
+          active = item;
+          const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
+          onPersisted(item, nextCursor);
+          return nextCursor;
+        });
       });
-      replayScheduleCommitted = true;
-      committed.push(item);
-      onCommitted(item, cursor);
     } catch (error) {
-      failedProviders.add(item.provider.name);
-      failedItems.push(item);
-      if (onError(error, item) === 'stop') {
-        return {
-          committed,
-          failedProviders,
-          failedItems,
-          complete: false,
-          stopped: { item, error },
-        };
+      for (const item of batch) {
+        failedProviders.add(item.provider.name);
+        failedItems.push(item);
       }
+      if (onError(error, active) === 'stop') {
+        return { committed, failedProviders, failedItems, complete: false, stopped: { item: active, error } };
+      }
+      continue;
+    }
+    replayScheduleCommitted = true;
+    for (const [index, item] of batch.entries()) {
+      committed.push(item);
+      onCommitted(item, cursors[index]!);
     }
   }
   return {
@@ -447,7 +479,7 @@ export function writeProviderIndexMarkers(
     }
   }
   for (const item of result.failedItems) {
-    if (plan.pendingMarkers.has(item.provider.name)) retry.run(item.unit.key);
+    if (plan.pendingMarkers.has(item.provider.name) || item.unit.atomicGroup !== undefined) retry.run(item.unit.key);
   }
   writePendingMarkers(db, plan);
 }

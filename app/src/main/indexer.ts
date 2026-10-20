@@ -28,6 +28,7 @@ import {
   ProviderIndexFailure,
   readRecentTranscriptHints,
   readProviderIndexState,
+  readProviderSessionProvenance,
   writeProviderIndexMarkers,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
@@ -118,19 +119,7 @@ function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionP
     if (!sessionColumns.has('id') || !sessionColumns.has('jsonl_path')) {
       throw new Error(`Preserved Obelisk sessions schema is incomplete: ${sourceDbPath}`);
     }
-    const sourceExpression = sessionColumns.has('source')
-      ? "COALESCE(source, 'claude')"
-      : "'claude'";
-    const sessions = db.prepare(`
-      SELECT id, jsonl_path, ${sourceExpression} AS source
-      FROM previous_obelisk.sessions
-      WHERE jsonl_path IS NOT NULL
-        AND jsonl_path != ''
-    `).all().map(row => ({
-      source: String(row.source),
-      sessionId: String(row.id),
-      jsonlPath: String(row.jsonl_path),
-    }));
+    const sessions = readProviderSessionProvenance(db, 'previous_obelisk');
     return { sessions, indexState: readProviderIndexState(db, 'previous_obelisk') };
   } finally {
     db.exec('DETACH DATABASE previous_obelisk');
