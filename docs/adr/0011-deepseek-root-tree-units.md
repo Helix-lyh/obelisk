@@ -108,6 +108,8 @@ of historical ownership: links can be rebound and members can move while the old
 project remains. A checkpoint is trusted only for its own indexed session id.
 While future artifacts exist, an indexed tree whose historical member identities
 are not fully accounted for in the current census retains its last-good closure.
+A rootless group remains ownership evidence, but cannot account for historical
+members because it cannot publish a replacement tree.
 Unknown envelopes may change id, scope and location together, and a source path
 may be rebound or replaced by a regular directory. Without historical physical
 namespace evidence, no current-path comparison can distinguish such a move from

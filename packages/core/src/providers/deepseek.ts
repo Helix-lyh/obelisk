@@ -672,8 +672,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     members: group.paths.map(path => canonicalDeepseekTreeSessionId(rawIdByPath.get(path)!, group.scope)),
   }));
   const currentPathsBySessionId = new Map(candidates.map(candidate => [candidate.id, candidate.paths]));
+  // Rootless groups still link ownership below, but cannot account for a
+  // historical member: they never emit a replacement unit.
   const currentMemberIds = new Set(unsupportedVersion.length > 0
-    ? candidates.flatMap(candidate => candidate.members) : []);
+    ? candidates.filter(candidate => candidate.members.includes(candidate.id))
+      .flatMap(candidate => candidate.members) : []);
   const uncertainProjects = new Set<string>();
   for (const indexed of ctx.indexedSessions?.() ?? []) {
     const previous = ctx.previousCursor?.(indexed.jsonlPath) ?? ctx.lastCursor(indexed.jsonlPath);

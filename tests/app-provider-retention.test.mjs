@@ -380,6 +380,93 @@ test('watch recovery replays every current and historical owner before publishin
   assert.deepEqual(after, messagesAt(snapshotPath), 'watch recovery equals a complete source snapshot');
 });
 
+// Controlled replacement boundary, as in cross-tree recovery above: released
+// DSH headers are immutable; this models replacement of ancestry plus a future
+// envelope changing scope, not a normal append by the current writer.
+function replaceChildParentWithFutureRoot(project, rootName) {
+  cpSync(join(FIXTURES, 'v3-ptc'), join(project, rootName), { recursive: true });
+  const rootPath = join(project, rootName, 'session.v3.jsonl');
+  const [rootHeader, ...rootBody] = readFileSync(rootPath, 'utf8').trimEnd().split('\n');
+  writeFileSync(rootPath, [JSON.stringify({ ...JSON.parse(rootHeader), id: rootName }), ...rootBody].join('\n') + '\n');
+  const future = publishFuture(project, rootName, { cwd: '/future-scope' });
+  const childPath = join(project, 'v3-seeded-child', 'session.v3.jsonl');
+  const [childHeader, ...childBody] = readFileSync(childPath, 'utf8').trimEnd().split('\n');
+  writeFileSync(childPath, [JSON.stringify({ ...JSON.parse(childHeader), parentSession: rootName }), ...childBody].join('\n') + '\n');
+  return { future, rootPath };
+}
+
+for (const rootName of ['a-new-parent', 'z-new-parent']) {
+  for (const mode of ['refresh', 'watch', 'force', 'replacement']) {
+    test(`a rootless group cannot release last-good child history (${rootName}, ${mode})`, () => {
+      const { home, root, project } = fixture();
+      const roots = Object.fromEntries(createBuiltinProviderRegistry().catalog()
+        .map(provider => [provider.id, join(home, 'empty', provider.id)]));
+      roots.deepseek = root;
+      const dbPath = join(home, 'index.sqlite');
+      const options = { dbPath, providerRoots: roots };
+      assert.equal(buildAppIndex(options).complete, true);
+      const before = messagesAt(dbPath);
+      const parentKey = join(project, 'v3-seeded-parent', 'session.v3.jsonl');
+      const initialDb = new DatabaseSync(dbPath);
+      const checkpoint = initialDb.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(parentKey).cursor;
+      initialDb.close();
+      const { future, rootPath } = replaceChildParentWithFutureRoot(project, rootName);
+      const healthy = appendHealthy(project);
+      const target = mode === 'replacement' ? join(home, 'replacement.sqlite') : dbPath;
+      const nextOptions = { ...options, dbPath: target };
+      const result = buildAppIndex({
+        ...nextOptions, force: mode === 'force' || mode === 'replacement',
+        ...(mode === 'replacement' ? { preserveDbPath: dbPath } : {}),
+        ...(mode === 'watch' ? { changedPaths: [future, healthy] } : {}),
+      });
+      assert.equal(result.complete, true);
+      assert.equal(result.skipped, 1);
+      assert.equal(result.skippedFiles[0].path, future);
+      const retained = messagesAt(target);
+      assert.deepEqual(retained.filter(row => row.text !== 'healthy sibling progressed'), before,
+        'a member without a publishable root cannot certify its historical owner complete');
+      assert.equal(retained.filter(row => row.text === 'healthy sibling progressed').length, 1);
+      const db = new DatabaseSync(target);
+      const state = db.prepare('SELECT cursor,replay_required FROM index_state WHERE jsonl_path=?').get(parentKey);
+      assert.equal(state.cursor, checkpoint);
+      assert.equal(state.replay_required, 1);
+      db.close();
+      if (mode === 'replacement') assert.deepEqual(messagesAt(dbPath), before);
+      rmSync(future);
+      const recovered = buildAppIndex({ ...nextOptions, ...(mode === 'watch' ? { changedPaths: [future] } : {}) });
+      assert.equal(recovered.complete, true);
+      assert.equal(recovered.skipped, 0);
+      const recoveredDb = new DatabaseSync(target);
+      const owner = recoveredDb.prepare('SELECT id FROM sessions WHERE jsonl_path=?').get(rootPath).id;
+      const childRows = messagesAt(target).filter(row => row.agent_id !== null);
+      assert.equal(childRows.length, before.filter(row => row.agent_id !== null).length);
+      assert.ok(childRows.every(row => row.session_id === owner), 'the child is published under its recovered owner');
+      assert.equal(recoveredDb.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(parentKey).replay_required, 0);
+      recoveredDb.close();
+      const fresh = join(home, 'fresh.sqlite');
+      assert.equal(buildAppIndex({ ...nextOptions, dbPath: fresh, force: true }).complete, true);
+      assert.deepEqual(messagesAt(target), messagesAt(fresh));
+    });
+  }
+}
+
+test('CLI rebuild retains children whose current scoped group has no root', () => {
+  const { home, project } = fixture();
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const initial = runCli(['--build'], { home });
+  assert.equal(initial.status, 0, initial.stderr || initial.stdout);
+  const before = messagesAt(dbPath);
+  const { future } = replaceChildParentWithFutureRoot(project, 'new-parent');
+  appendHealthy(project);
+  const result = runCli(['--build'], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).ok, true);
+  assert.ok(result.stderr.includes(future));
+  const after = messagesAt(dbPath);
+  assert.deepEqual(after.filter(row => row.text !== 'healthy sibling progressed'), before);
+  assert.equal(after.filter(row => row.text === 'healthy sibling progressed').length, 1);
+});
+
 test('desktop replacement retains history with the production SQLite binding', () => {
   const { home, project, provider } = fixture();
   const dbPath = join(home, 'old.sqlite');
